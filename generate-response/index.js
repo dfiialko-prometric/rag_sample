@@ -1,5 +1,5 @@
 const { app } = require('@azure/functions');
-const { searchDocuments } = require('../shared/searchClient');
+const { searchDocuments } = require('../shared/searchClientBasic');
 const axios = require('axios');
 require('dotenv').config();
 
@@ -44,7 +44,7 @@ app.http('generateResponse', {
       if (searchResults.length === 0) {
         return {
           status: 200,
-          body: {
+          jsonBody: {
             success: true,
             question: question,
             response: "I couldn't find any relevant information in the uploaded documents to answer your question.",
@@ -55,16 +55,16 @@ app.http('generateResponse', {
       }
 
       // 2. Prepare context from search results
-      const context = searchResults
+      const searchContext = searchResults
         .map(result => result.document.content)
         .join('\n\n');
 
       // 3. Generate response using OpenAI (simplified for now)
-      const response = await generateAIResponse(question, context);
+      const response = await generateAIResponse(question, searchContext);
 
       return {
         status: 200,
-        body: {
+        jsonBody: {
           success: true,
           question: question,
           response: response,
@@ -72,7 +72,7 @@ app.http('generateResponse', {
             filename: result.document.filename,
             chunkIndex: result.document.chunkIndex,
             score: result.score,
-            content: result.document.content.substring(0, 200) + '...'
+            content: result.document.content.substring(0, 500) + '...'
           })),
           searchResults: searchResults.length
         }
@@ -82,7 +82,7 @@ app.http('generateResponse', {
       context.error('Generate response error:', error);
       return {
         status: 500,
-        body: {
+        jsonBody: {
           success: false,
           error: error.message
         }
@@ -90,6 +90,29 @@ app.http('generateResponse', {
     }
   }
 });
+
+/**
+ * Extract URL mappings from context to improve AI accuracy
+ */
+function extractUrlMappings(context) {
+  const lines = context.split('\n');
+  const urlMappings = [];
+  
+  for (let i = 0; i < lines.length - 1; i++) {
+    const currentLine = lines[i].trim();
+    const nextLine = lines[i + 1].trim();
+    
+    // If current line looks like a service name and next line is a URL
+    if (currentLine && nextLine.startsWith('https://')) {
+      urlMappings.push({
+        service: currentLine,
+        url: nextLine
+      });
+    }
+  }
+  
+  return urlMappings;
+}
 
 /**
  * Generate AI response using OpenAI API
@@ -105,10 +128,24 @@ async function generateAIResponse(question, context) {
   }
 
   try {
-    const prompt = `Based on the following context, please answer the question. If the context doesn't contain enough information to answer the question, say so.
+    // Extract URL mappings for better accuracy when needed
+    const urlMappings = extractUrlMappings(context);
+    const mappingsText = urlMappings.length > 0 && question.toLowerCase().includes('url')
+      ? `\n\nAvailable URLs:\n${urlMappings.map(m => `${m.service}: ${m.url}`).join('\n')}`
+      : '';
+
+    const prompt = `Based on the following context from company documents, please answer the question accurately and completely.
+
+Guidelines:
+1. Use only information provided in the context
+2. Be specific and cite relevant details from the documents
+3. If the context doesn't contain enough information, say so clearly
+4. For policy questions, provide the exact policy details as stated
+5. For URL requests, match service names precisely
+6. If there are multiple relevant sections, summarize all relevant information
 
 Context:
-${context}
+${context}${mappingsText}
 
 Question: ${question}
 
@@ -119,15 +156,15 @@ Answer:`;
       messages: [
         {
           role: 'system',
-          content: 'You are a helpful assistant that answers questions based on the provided context. Be concise and accurate.'
+          content: 'You are a helpful HR assistant that answers questions based on company documents and policies. Provide accurate, complete answers based on the provided context. When answering policy questions, be thorough and include all relevant details. When providing URLs or specific information, be precise and match the exact terms used in the documents.'
         },
         {
           role: 'user',
           content: prompt
         }
       ],
-      max_tokens: 500,
-      temperature: 0.7
+      max_tokens: 800,  // Increased for longer policy explanations
+      temperature: 0.3  // Balanced between accuracy and natural language
     }, {
       headers: {
         'Authorization': `Bearer ${apiKey}`,
@@ -138,7 +175,6 @@ Answer:`;
     return response.data.choices[0].message.content;
 
   } catch (error) {
-    console.error('OpenAI API error:', error);
     return "I'm sorry, but I encountered an error while generating the response. Please try again later.";
   }
 } 

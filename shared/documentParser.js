@@ -18,6 +18,8 @@ async function parseDocument(filePath) {
       case '.docx':
       case '.doc':
         return await parseWord(filePath);
+      case '.txt':
+        return await parseText(filePath);
       default:
         throw new Error(`Unsupported file type: ${ext}`);
     }
@@ -45,6 +47,16 @@ async function parsePDF(filePath) {
 async function parseWord(filePath) {
   const result = await mammoth.extractRawText({ path: filePath });
   return result.value;
+}
+
+/**
+ * Parse text document
+ * @param {string} filePath - Path to text file
+ * @returns {Promise<string>} - Extracted text
+ */
+async function parseText(filePath) {
+  const data = await fs.readFile(filePath, 'utf8');
+  return data;
 }
 
 module.exports = { parseDocument }; 
