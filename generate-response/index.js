@@ -4,10 +4,24 @@ const axios = require('axios');
 require('dotenv').config();
 
 app.http('generateResponse', {
-  methods: ['GET', 'POST'],
+  methods: ['GET', 'POST', 'OPTIONS'],
   authLevel: 'anonymous',
   handler: async (request, context) => {
     try {
+      // Handle CORS preflight requests
+      if (request.method === 'OPTIONS') {
+        return {
+          status: 200,
+          headers: {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With',
+            'Access-Control-Max-Age': '86400'
+          },
+          body: ''
+        };
+      }
+
       context.log('Generate response function started');
 
       let question, topK = 5;
@@ -44,6 +58,12 @@ app.http('generateResponse', {
       if (searchResults.length === 0) {
         return {
           status: 200,
+          headers: {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type'
+          },
           jsonBody: {
             success: true,
             question: question,
@@ -64,15 +84,19 @@ app.http('generateResponse', {
 
       return {
         status: 200,
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type'
+        },
         jsonBody: {
           success: true,
           question: question,
           response: response,
-          sources: searchResults.map(result => ({
-            filename: result.document.filename,
-            chunkIndex: result.document.chunkIndex,
-            score: result.score,
-            content: result.document.content.substring(0, 500) + '...'
+          sources: [...new Set(searchResults.map(result => result.document.filename))].map(filename => ({
+            filename: filename,
+            count: searchResults.filter(result => result.document.filename === filename).length
           })),
           searchResults: searchResults.length
         }
@@ -82,6 +106,12 @@ app.http('generateResponse', {
       context.error('Generate response error:', error);
       return {
         status: 500,
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type'
+        },
         jsonBody: {
           success: false,
           error: error.message
@@ -143,6 +173,9 @@ Guidelines:
 4. For policy questions, provide the exact policy details as stated
 5. For URL requests, match service names precisely
 6. If there are multiple relevant sections, summarize all relevant information
+7. IMPORTANT: Only use information that is directly relevant to the question. Ignore irrelevant content even if it appears in the context
+8. For technical questions (URLs, systems, etc.), focus only on technical documents and ignore policy/dress code documents
+9. For policy questions (dress code, procedures, etc.), focus only on policy documents
 
 Context:
 ${context}${mappingsText}

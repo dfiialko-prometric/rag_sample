@@ -5,10 +5,24 @@ const { chunkText } = require('../shared/chunker');
 const { storeInSearch } = require('../shared/searchClientBasic');
 
 app.http('uploadDocumentsBasic', {
-  methods: ['POST'],
+  methods: ['POST', 'OPTIONS'],
   authLevel: 'anonymous',
   handler: async (request, context) => {
     try {
+      // Handle CORS preflight requests
+      if (request.method === 'OPTIONS') {
+        return {
+          status: 200,
+          headers: {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With',
+            'Access-Control-Max-Age': '86400'
+          },
+          body: ''
+        };
+      }
+
       context.log('Upload documents function started');
 
       // Get text content from request body
@@ -17,6 +31,12 @@ app.http('uploadDocumentsBasic', {
       if (!body || body.trim().length === 0) {
         return {
           status: 400,
+          headers: {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type'
+          },
           jsonBody: {
             success: false,
             error: 'No text content provided'
@@ -52,6 +72,12 @@ app.http('uploadDocumentsBasic', {
 
       return {
         status: 200,
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type'
+        },
         jsonBody: {
           success: true,
           documentId: documentId,
@@ -68,6 +94,12 @@ app.http('uploadDocumentsBasic', {
       context.error('Function error:', error);
       return {
         status: 500,
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type'
+        },
         jsonBody: {
           success: false,
           error: error.message
