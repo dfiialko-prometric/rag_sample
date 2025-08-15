@@ -1,63 +1,63 @@
-// Configuration - Azure Functions URL
+// API endpoint for our Azure functions
 const API_BASE_URL = 'https://prochat-function-app-d2gnekb9cadvfmes.canadacentral-01.azurewebsites.net/api';
 
-// Global state
-let documentsCount = 0;
-let questionsCount = 0;
-let totalChunks = 0;
+// Keep track of some basic stats
+let docsUploaded = 0;
+let questionsAsked = 0;
+let chunksCreated = 0;
 
-// Initialize the app
+// Get everything set up when page loads
 document.addEventListener('DOMContentLoaded', function() {
-    setupFileUpload();
-    updateStats();
+    initializeFileUpload();
+    refreshStats();
 });
 
-// File upload setup
-function setupFileUpload() {
-    const uploadZone = document.getElementById('uploadSection');
+// Set up drag-and-drop file uploads
+function initializeFileUpload() {
+    const uploadArea = document.getElementById('uploadSection');
     const fileInput = document.getElementById('fileInput');
 
-    // Drag and drop handlers
-    uploadZone.addEventListener('dragover', handleDragOver);
-    uploadZone.addEventListener('dragleave', handleDragLeave);
-    uploadZone.addEventListener('drop', handleDrop);
+    // Handle drag and drop
+    uploadArea.addEventListener('dragover', onDragOver);
+    uploadArea.addEventListener('dragleave', onDragLeave);
+    uploadArea.addEventListener('drop', onFileDrop);
 
-    // File input change handler
-    fileInput.addEventListener('change', handleFileSelect);
+    // Handle regular file selection
+    fileInput.addEventListener('change', onFileSelected);
 }
 
-function handleDragOver(e) {
+function onDragOver(e) {
     e.preventDefault();
     e.stopPropagation();
     document.getElementById('uploadSection').classList.add('dragover');
 }
 
-function handleDragLeave(e) {
+function onDragLeave(e) {
     e.preventDefault();
     e.stopPropagation();
     document.getElementById('uploadSection').classList.remove('dragover');
 }
 
-function handleDrop(e) {
+function onFileDrop(e) {
     e.preventDefault();
     e.stopPropagation();
     document.getElementById('uploadSection').classList.remove('dragover');
     
     const files = e.dataTransfer.files;
     if (files.length > 0) {
-        uploadFile(files[0]);
+        processFileUpload(files[0]);
     }
 }
 
-function handleFileSelect(e) {
-    const file = e.target.files[0];
-    if (file) {
-        uploadFile(file);
+function onFileSelected(e) {
+    const selectedFile = e.target.files[0];
+    if (selectedFile) {
+        processFileUpload(selectedFile);
     }
 }
 
-// File upload function
-async function uploadFile(file) {
+// Handle file upload process  
+async function processFileUpload(file) {
     const uploadStatus = document.getElementById('uploadStatus');
     const uploadBtn = document.querySelector('.btn');
     
@@ -69,8 +69,8 @@ async function uploadFile(file) {
     uploadStatus.textContent = `Uploading ${file.name}...`;
 
     try {
-        // Read file content
-        const text = await readFileAsText(file);
+        // Extract text from the file
+        const text = await extractTextFromFile(file);
         
         // Prepare the payload
         const payload = {
@@ -78,7 +78,7 @@ async function uploadFile(file) {
             filename: file.name
         };
 
-        // Upload to Azure Functions
+        // Update this to uploadDocuments for Vector DB usage
         const response = await fetch(`${API_BASE_URL}/uploadDocumentsBasic`, {
             method: 'POST',
             headers: {
@@ -94,22 +94,22 @@ async function uploadFile(file) {
             uploadStatus.className = 'upload-status status-success';
             uploadStatus.textContent = `✅ Successfully uploaded ${file.name} (${result.chunksProcessed} chunks created)`;
             
-            // Update stats
-            documentsCount++;
-            totalChunks += result.chunksProcessed;
-            updateStats();
+            // Update our counters
+            docsUploaded++;
+            chunksCreated += result.chunksProcessed;
+            refreshStats();
 
             // Add success message to chat
-            addMessage('assistant', `📄 Document "${file.name}" uploaded successfully! Created ${result.chunksProcessed} searchable chunks. You can now ask questions about it.`);
+            showChatMessage('assistant', `📄 Document "${file.name}" uploaded successfully! Created ${result.chunksProcessed} searchable chunks. You can now ask questions about it.`);
         } else {
             throw new Error(result.error || 'Upload failed');
         }
     } catch (error) {
         // Error
         uploadStatus.className = 'upload-status status-error';
-        uploadStatus.textContent = `❌ Upload failed: ${error.message}`;
+        uploadStatus.textContent = `Upload failed: ${error.message}`;
         
-        addMessage('assistant', `❌ Sorry, I couldn't upload "${file.name}". Please try again.`);
+        showChatMessage('assistant', ` Sorry, I couldn't upload "${file.name}". Please try again.`);
     } finally {
         // Reset upload button
         uploadBtn.disabled = false;
@@ -120,8 +120,8 @@ async function uploadFile(file) {
     }
 }
 
-// Read file as text
-function readFileAsText(file) {
+// Extract text from uploaded file
+function extractTextFromFile(file) {
     return new Promise((resolve, reject) => {
         const reader = new FileReader();
         
@@ -142,14 +142,14 @@ function readFileAsText(file) {
     });
 }
 
-// Chat functionality
+// Handle Enter key in chat input
 function handleKeyPress(event) {
     if (event.key === 'Enter') {
-        askQuestion();
+        submitQuestion();
     }
 }
 
-async function askQuestion() {
+async function submitQuestion() {
     const questionInput = document.getElementById('questionInput');
     const question = questionInput.value.trim();
     
@@ -158,8 +158,8 @@ async function askQuestion() {
     const askBtn = document.getElementById('askBtn');
     const loadingIndicator = document.getElementById('loadingIndicator');
 
-    // Add user message
-    addMessage('user', question);
+    // Show user's question
+    showChatMessage('user', question);
     
     // Clear input and show loading
     questionInput.value = '';
@@ -179,16 +179,16 @@ async function askQuestion() {
                 ? `\n\n📚 Sources: ${[...new Set(result.sources.map(s => s.filename))].join(', ')}`
                 : '';
             
-            addMessage('assistant', result.response + sources);
+            showChatMessage('assistant', result.response + sources);
             
-            // Update question count
-            questionsCount++;
-            updateStats();
+            // Keep track of questions asked
+            questionsAsked++;
+            refreshStats();
         } else {
             throw new Error(result.error || 'Failed to generate response');
         }
     } catch (error) {
-        addMessage('assistant', `❌ Sorry, I encountered an error: ${error.message}`);
+        showChatMessage('assistant', `Sorry, I encountered an error: ${error.message}`);
     } finally {
         // Reset UI
         askBtn.disabled = false;
@@ -196,8 +196,8 @@ async function askQuestion() {
     }
 }
 
-// Add message to chat
-function addMessage(sender, content) {
+// Display a new message in the chat
+function showChatMessage(sender, content) {
     const chatMessages = document.getElementById('chatMessages');
     
     const messageDiv = document.createElement('div');
@@ -218,15 +218,15 @@ function addMessage(sender, content) {
     chatMessages.scrollTop = chatMessages.scrollHeight;
 }
 
-// Update statistics
-function updateStats() {
-    const documentsCountEl = document.getElementById('documentsCount');
-    const questionsCountEl = document.getElementById('questionsCount');
-    const chunksCountEl = document.getElementById('chunksCount');
+// Update the stats display
+function refreshStats() {
+    const docsElement = document.getElementById('documentsCount');
+    const questionsElement = document.getElementById('questionsCount');
+    const chunksElement = document.getElementById('chunksCount');
     
-    if (documentsCountEl) documentsCountEl.textContent = documentsCount;
-    if (questionsCountEl) questionsCountEl.textContent = questionsCount;
-    if (chunksCountEl) chunksCountEl.textContent = totalChunks;
+    if (docsElement) docsElement.textContent = docsUploaded;
+    if (questionsElement) questionsElement.textContent = questionsAsked;
+    if (chunksElement) chunksElement.textContent = chunksCreated;
 }
 
 // Utility function to format file size

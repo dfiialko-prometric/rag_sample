@@ -22,25 +22,25 @@ app.http('generateResponse', {
         };
       }
 
-      context.log('Generate response function started');
+      context.log('Starting to process question');
 
-      let question, topK = 5;
+      let userQuestion, maxResults = 5;
 
       if (request.method === 'GET') {
-        // Handle GET request with query parameters
-        question = request.query.get('question');
-        const topKParam = request.query.get('top');
-        if (topKParam) {
-          topK = parseInt(topKParam);
+        // Get question from URL params
+        userQuestion = request.query.get('question');
+        const numResults = request.query.get('top');
+        if (numResults) {
+          maxResults = parseInt(numResults);
         }
       } else {
-        // Handle POST request with JSON body
-        const body = await request.json();
-        question = body.question;
-        topK = body.top || 5;
+        // Get question from request body
+        const requestBody = await request.json();
+        userQuestion = requestBody.question;
+        maxResults = requestBody.top || 5;
       }
 
-      if (!question) {
+      if (!userQuestion) {
         return {
           status: 400,
           body: {
@@ -50,12 +50,12 @@ app.http('generateResponse', {
         };
       }
 
-      context.log(`Generating response for: "${question}"`);
+      context.log(`Looking for info about: "${userQuestion}"`);
 
-      // 1. Search for relevant documents
-      const searchResults = await searchDocuments(question, topK);
+      // Find documents that might have the answer
+      const relevantDocs = await searchDocuments(userQuestion, maxResults);
       
-      if (searchResults.length === 0) {
+      if (relevantDocs.length === 0) {
         return {
           status: 200,
           headers: {
@@ -66,7 +66,7 @@ app.http('generateResponse', {
           },
           jsonBody: {
             success: true,
-            question: question,
+            question: userQuestion,
             response: "I couldn't find any relevant information in the uploaded documents to answer your question.",
             sources: [],
             searchResults: []
@@ -74,13 +74,13 @@ app.http('generateResponse', {
         };
       }
 
-      // 2. Prepare context from search results
-      const searchContext = searchResults
-        .map(result => result.document.content)
+      // Pull together content from all the relevant docs
+      const documentContent = relevantDocs
+        .map(doc => doc.document.content)
         .join('\n\n');
 
-      // 3. Generate response using OpenAI (simplified for now)
-      const response = await generateAIResponse(question, searchContext);
+      // Ask OpenAI to answer based on what we found
+      const aiAnswer = await getAnswerFromOpenAI(userQuestion, documentContent);
 
       return {
         status: 200,
@@ -92,13 +92,13 @@ app.http('generateResponse', {
         },
         jsonBody: {
           success: true,
-          question: question,
-          response: response,
-          sources: [...new Set(searchResults.map(result => result.document.filename))].map(filename => ({
+          question: userQuestion,
+          response: aiAnswer,
+          sources: [...new Set(relevantDocs.map(doc => doc.document.filename))].map(filename => ({
             filename: filename,
-            count: searchResults.filter(result => result.document.filename === filename).length
+            count: relevantDocs.filter(doc => doc.document.filename === filename).length
           })),
-          searchResults: searchResults.length
+          searchResults: relevantDocs.length
         }
       };
 
@@ -144,13 +144,8 @@ function extractUrlMappings(context) {
   return urlMappings;
 }
 
-/**
- * Generate AI response using OpenAI API
- * @param {string} question - User question
- * @param {string} context - Context from search results
- * @returns {Promise<string>} - AI generated response
- */
-async function generateAIResponse(question, context) {
+// Get an answer from OpenAI based on our document content
+async function getAnswerFromOpenAI(question, documentText) {
   const apiKey = process.env.OPENAI_API_KEY;
   
   if (!apiKey) {
@@ -158,13 +153,13 @@ async function generateAIResponse(question, context) {
   }
 
   try {
-    // Extract URL mappings for better accuracy when needed
-    const urlMappings = extractUrlMappings(context);
-    const mappingsText = urlMappings.length > 0 && question.toLowerCase().includes('url')
+    // See if we can find any URL mappings to help with URL questions
+    const urlMappings = extractUrlMappings(documentText);
+    const urlInfo = urlMappings.length > 0 && question.toLowerCase().includes('url')
       ? `\n\nAvailable URLs:\n${urlMappings.map(m => `${m.service}: ${m.url}`).join('\n')}`
       : '';
 
-    const prompt = `Based on the following context from company documents, please answer the question accurately and completely.
+    const systemPrompt = `Based on the following context from company documents, please answer the question accurately and completely.
 
 Guidelines:
 1. Use only information provided in the context
@@ -178,7 +173,7 @@ Guidelines:
 9. For policy questions (dress code, procedures, etc.), focus only on policy documents
 
 Context:
-${context}${mappingsText}
+${documentText}${urlInfo}
 
 Question: ${question}
 
@@ -193,11 +188,11 @@ Answer:`;
         },
         {
           role: 'user',
-          content: prompt
+          content: systemPrompt
         }
       ],
-      max_tokens: 800,  // Increased for longer policy explanations
-      temperature: 0.3  // Balanced between accuracy and natural language
+      max_tokens: 800,  // Give it room for detailed answers
+      temperature: 0.3  // Keep responses focused but not robotic
     }, {
       headers: {
         'Authorization': `Bearer ${apiKey}`,

@@ -46,6 +46,7 @@ async function uploadTextToAzure(text, filename) {
   };
   
   try {
+    // Update this to uploadDocuments for Vector DB usage
     const response = await axios.post(`${BASE_URL}/uploadDocumentsBasic`, uploadPayload, {
       headers: {
         'Content-Type': 'application/json'
@@ -58,9 +59,7 @@ async function uploadTextToAzure(text, filename) {
   }
 }
 
-/**
- * Search documents in Azure Search
- */
+// Update this to searchDocuments for Vector DB usage
 async function searchDocuments(query, topK = 5) {
   const response = await axios.get(`${BASE_URL}/searchDocumentsBasic`, {
     params: { q: query, topK: topK }

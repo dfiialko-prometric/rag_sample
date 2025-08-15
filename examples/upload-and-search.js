@@ -46,8 +46,7 @@ async function uploadAndSearch() {
     console.log(`ID: ${uploadResponse.data.documentId}`);
     console.log(`Chunks: ${uploadResponse.data.chunksProcessed}\n`);
     
-    // Step 2: Search for content
-    console.log('2. Searching for content...');
+    // Update this to searchDocuments for Vector DB usage
     const searchQuery = 'machine learning';
     const searchResponse = await axios.get(`${BASE_URL}/searchDocuments?q=${encodeURIComponent(searchQuery)}`);
     
