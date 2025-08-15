@@ -63,12 +63,50 @@ async function processFileUpload(file) {
     
     // Show loading state
     uploadBtn.disabled = true;
-    uploadBtn.textContent = 'Uploading...';
+    uploadBtn.textContent = 'Processing...';
     uploadStatus.style.display = 'block';
     uploadStatus.className = 'upload-status';
-    uploadStatus.textContent = `Uploading ${file.name}...`;
+    uploadStatus.textContent = `Processing ${file.name}...`;
 
     try {
+        // ========================================
+        // TEMPORARY: LOCAL PROCESS AND UPLOAD
+        // ========================================
+        // TODO: REPLACE BACK TO AZURE FUNCTION WHEN READY
+        // ========================================
+        
+        // Create FormData to send file to local processing
+        const formData = new FormData();
+        formData.append('file', file);
+        
+        // Call local processing endpoint (assuming you have a local server running)
+        const response = await fetch('/process-and-upload', {
+            method: 'POST',
+            body: formData
+        });
+
+        const result = await response.json();
+
+        if (result.success) {
+            // Success
+            uploadStatus.className = 'upload-status status-success';
+            uploadStatus.textContent = `✅ Successfully processed ${file.name} (${result.chunksProcessed} chunks created)`;
+            
+            // Update our counters
+            docsUploaded++;
+            chunksCreated += result.chunksProcessed;
+            refreshStats();
+
+            // Add success message to chat
+            showChatMessage('assistant', `📄 Document "${file.name}" processed successfully! Created ${result.chunksProcessed} searchable chunks. You can now ask questions about it.`);
+        } else {
+            throw new Error(result.error || 'Processing failed');
+        }
+        
+        // ========================================
+        // ORIGINAL AZURE FUNCTION CODE (COMMENTED OUT)
+        // ========================================
+        /*
         // Extract text from the file
         const text = await extractTextFromFile(file);
         
@@ -104,12 +142,17 @@ async function processFileUpload(file) {
         } else {
             throw new Error(result.error || 'Upload failed');
         }
+        */
+        // ========================================
+        // END ORIGINAL AZURE FUNCTION CODE
+        // ========================================
+        
     } catch (error) {
         // Error
         uploadStatus.className = 'upload-status status-error';
-        uploadStatus.textContent = `Upload failed: ${error.message}`;
+        uploadStatus.textContent = `Processing failed: ${error.message}`;
         
-        showChatMessage('assistant', ` Sorry, I couldn't upload "${file.name}". Please try again.`);
+        showChatMessage('assistant', ` Sorry, I couldn't process "${file.name}". Please try again.`);
     } finally {
         // Reset upload button
         uploadBtn.disabled = false;

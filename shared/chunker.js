@@ -14,7 +14,7 @@ async function chunkText(text) {
   });
   
   const chunks = await textSplitter.splitText(text);
-  return chunks.map(chunk => chunk.trim()).filter(chunk => chunk.length > 50);
+  return chunks.map(chunk => chunk.trim()).filter(chunk => chunk.length > 10);
 }
 
 /**
