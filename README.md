@@ -62,7 +62,7 @@ A Retrieval-Augmented Generation (RAG) system built with Azure Functions, Azure 
 
 ```bash
 git clone <your-repo-url>
-cd rag-azure-functions
+cd rag_sample (cloned repo folder)
 npm install
 ```
 
@@ -95,7 +95,7 @@ AZURE_OPENAI_CHAT_DEPLOYMENT_NAME=your-chat-deployment
 AZURE_FUNCTION_URL=https://your-function-app.azurewebsites.net
 ```
 
-### 3. Azure AI Search Setup
+### 3. Azure AI Search Setup - already setup
 
 Create the search index using the provided script:
 
