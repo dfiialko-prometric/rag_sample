@@ -79,8 +79,8 @@ async function processFileUpload(file) {
         const formData = new FormData();
         formData.append('file', file);
         
-        // Call local processing endpoint (assuming you have a local server running)
-        const response = await fetch('/process-and-upload', {
+        // Call local processing endpoint that forwards to Azure Functions
+        const response = await fetch('/upload', {
             method: 'POST',
             body: formData
         });
@@ -210,9 +210,9 @@ async function submitQuestion() {
     loadingIndicator.style.display = 'block';
 
     try {
-        // Call the generate response API
-        console.log('Making request to:', `${API_BASE_URL}/generateResponse?question=${encodeURIComponent(question)}`);
-        const response = await fetch(`${API_BASE_URL}/generateResponse?question=${encodeURIComponent(question)}`);
+        // Call the generate response API through local proxy
+        console.log('Making request to:', `/ask?question=${encodeURIComponent(question)}`);
+        const response = await fetch(`/ask?question=${encodeURIComponent(question)}`);
         console.log('Response status:', response.status);
         const result = await response.json();
 

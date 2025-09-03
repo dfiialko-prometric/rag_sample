@@ -1,5 +1,6 @@
 const { app } = require('@azure/functions');
-const { searchDocuments } = require('../shared/searchClientBasic');
+const { searchDocuments, hybridSearch } = require('../shared/searchClient');
+const { createEmbeddings } = require('../shared/embeddings');
 const axios = require('axios');
 require('dotenv').config();
 
@@ -43,17 +44,28 @@ app.http('generateResponse', {
       if (!userQuestion) {
         return {
           status: 400,
-          body: {
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
             success: false,
             error: 'Question parameter is required'
-          }
+          })
         };
       }
 
       context.log(`Looking for info about: "${userQuestion}"`);
 
-      // Find documents that might have the answer
-      const relevantDocs = await searchDocuments(userQuestion, maxResults);
+      // Find documents that might have the answer using hybrid search
+      let relevantDocs;
+      try {
+        // Try hybrid search first (text + vector)
+        const queryEmbedding = await createEmbeddings([userQuestion]);
+        relevantDocs = await hybridSearch(userQuestion, queryEmbedding[0], maxResults);
+        context.log(`✅ Hybrid search found ${relevantDocs.length} relevant documents`);
+      } catch (error) {
+        context.log(`⚠️ Hybrid search failed, falling back to text search: ${error.message}`);
+        // Fallback to text search if vector search fails
+        relevantDocs = await searchDocuments(userQuestion, maxResults);
+      }
       
       if (relevantDocs.length === 0) {
         return {
@@ -205,4 +217,4 @@ Answer:`;
   } catch (error) {
     return "I'm sorry, but I encountered an error while generating the response. Please try again later.";
   }
-} 
+}

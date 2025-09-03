@@ -1,14 +1,16 @@
 # RAG Azure Functions
 
-A Retrieval-Augmented Generation (RAG) system built with Azure Functions, Azure AI Search, and OpenAI. This system allows you to upload documents, search through them semantically, and generate AI-powered responses based on the retrieved content.
+A Retrieval-Augmented Generation (RAG) system built with Azure Functions, Azure AI Search, and OpenAI. This system allows you to upload documents, perform semantic search using vector embeddings, and generate AI-powered responses based on retrieved content.
 
 ## Features
 
-- **Document Processing**: Upload and parse PDF and Word documents
-- **Semantic Chunking**: Split documents into meaningful chunks using Langchain
-- **Vector Search**: Store and search document embeddings in Azure AI Search
-- **AI Response Generation**: Generate contextual responses using OpenAI GPT models
-- **Serverless Architecture**: Built on Azure Functions for scalability
+- Document Processing: Upload and parse PDF and Word documents
+- Text Chunking: Split documents into meaningful chunks for processing
+- Vector Embeddings: Generate 1536-dimensional embeddings using OpenAI
+- Hybrid Search: Combine text and vector search for optimal results
+- Semantic Search: Find relevant content using vector similarit
+- AI Response Generation: Generate contextual responses using retrieved content
+- Serverless Architecture: Built on Azure Functions for scalability
 
 ## Architecture
 
@@ -29,23 +31,23 @@ A Retrieval-Augmented Generation (RAG) system built with Azure Functions, Azure 
 
 ## Azure Functions
 
-### 1. `uploadDocuments`
-- **Method**: POST
-- **Purpose**: Upload and process documents
-- **Input**: Multipart form data with document file
-- **Output**: Processing status and document ID
+ 1. `uploadDocuments`
+- Method: POST
+- Purpose: Upload and process documents
+- Input: Multipart form data with document file
+- Output: Processing status and document ID
 
-### 2. `searchDocuments`
-- **Method**: GET/POST
-- **Purpose**: Search through uploaded documents
-- **Input**: Query string and optional filters
-- **Output**: Relevant document chunks with scores
+ 2. `searchDocuments`
+- Method: GET/POST
+- Purpose: Search through uploaded documents using text, vector, or hybrid search
+- Input: Query string, search type (text/vector/hybrid), and optional filters
+- Output: Relevant document chunks with similarity scores
 
-### 3. `generateResponse`
-- **Method**: GET/POST
-- **Purpose**: Generate AI responses based on search results
-- **Input**: Question and optional context
-- **Output**: AI-generated response with source references
+ 3. `generateResponse`
+- Method: GET/POST
+- Purpose: Generate AI responses based on search results
+- Input: Question and optional context
+- Output: AI-generated response with source references
 
 ## Prerequisites
 
@@ -58,7 +60,7 @@ A Retrieval-Augmented Generation (RAG) system built with Azure Functions, Azure 
 
 ## Setup
 
-### 1. Clone and Install
+ 1. Clone and Install
 
 ```bash
 git clone <your-repo-url>
@@ -66,7 +68,7 @@ cd rag_sample (cloned repo folder)
 npm install
 ```
 
-### 2. Environment Configuration
+ 2. Environment Configuration
 
 Copy the environment template and configure your settings:
 
@@ -95,15 +97,15 @@ AZURE_OPENAI_CHAT_DEPLOYMENT_NAME=your-chat-deployment
 AZURE_FUNCTION_URL=https://your-function-app.azurewebsites.net
 ```
 
-### 3. Azure AI Search Setup - already setup
+ 3. Azure AI Search Setup
 
-Create the search index using the provided script:
+Create the search index with vector search capabilities:
 
 ```bash
-node create-simple-search-index.js
+node create-search-index.js
 ```
 
-### 4. Local Development
+ 4. Local Development
 
 Start the Azure Functions locally:
 
@@ -118,20 +120,31 @@ The functions will be available at:
 
 ## Usage
 
-### Upload a Document
+ Upload a Document
 
 ```bash
 curl -X POST http://localhost:7071/api/uploadDocuments \
   -F "document=@/path/to/your/document.pdf"
 ```
 
-### Search Documents
+ Search Documents
 
+Text search:
 ```bash
-curl "http://localhost:7071/api/searchDocuments?q=your search query"
+curl "http://localhost:7071/api/searchDocuments?q=your search query&type=text"
 ```
 
-### Generate AI Response
+Vector search:
+```bash
+curl "http://localhost:7071/api/searchDocuments?q=your search query&type=vector"
+```
+
+Hybrid search (recommended):
+```bash
+curl "http://localhost:7071/api/searchDocuments?q=your search query&type=hybrid"
+```
+
+ Generate AI Response
 
 ```bash
 curl "http://localhost:7071/api/generateResponse?question=What is this about?"
@@ -142,9 +155,9 @@ curl "http://localhost:7071/api/generateResponse?question=What is this about?"
 ```
 ├── shared/                    # Shared utilities
 │   ├── documentParser.js     # PDF/Word document parsing
-│   ├── chunker.js           # Text chunking with Langchain
+│   ├── chunker.js           # Text chunking
 │   ├── embeddings.js        # OpenAI embeddings generation
-│   └── searchClient.js      # Azure AI Search client
+│   └── searchClient.js      # Azure AI Search client with vector support
 ├── upload-documents/         # Document upload function
 ├── search-documents/         # Search function
 ├── generate-response/        # AI response generation
@@ -155,25 +168,25 @@ curl "http://localhost:7071/api/generateResponse?question=What is this about?"
 
 ## Dependencies
 
-- **@azure/functions**: Azure Functions v4 runtime
-- **@azure/search-documents**: Azure AI Search client
-- **@azure/openai**: Azure OpenAI client
-- **langchain**: Text chunking and processing
-- **pdf-parse**: PDF document parsing
-- **mammoth**: Word document parsing
-- **multer**: File upload handling
-- **axios**: HTTP client for OpenAI API
-- **dotenv**: Environment variable management
+- @azure/functions: Azure Functions v4 runtime
+- @azure/search-documents: Azure AI Search client
+- @azure/openai: Azure OpenAI client
+- langchain: Text chunking and processing
+- pdf-parse: PDF document parsing
+- mammoth: Word document parsing
+- multer: File upload handling
+- axios: HTTP client for OpenAI API
+- dotenv: Environment variable management
 
 ## Deployment
 
-### Deploy to Azure
+un Deploy to Azure
 
-1. **Azure Functions Extension**: Use VS Code Azure Functions extension
-2. **Azure CLI**: Use `az functionapp deployment` commands
-3. **GitHub Actions**: Set up CI/CD pipeline
+1. Azure Functions Extension: Use VS Code Azure Functions extension
+2. Azure CLI: Use `az functionapp deployment` commands
+3. GitHub Actions: Set up CI/CD pipeline
 
-### Environment Variables in Azure
+ Environment Variables in Azure
 
 Configure the same environment variables in your Azure Function App settings through the Azure portal or Azure CLI.
 

@@ -1,4 +1,4 @@
-const { SearchClient, AzureKeyCredential } = require('@azure/search-documents');
+const { SearchClient, SearchIndexClient, AzureKeyCredential } = require('@azure/search-documents');
 require('dotenv').config();
 
 /**
@@ -21,14 +21,7 @@ function getSearchClient() {
   );
 }
 
-/**
- * Store document chunks in Azure AI Search
- * @param {string} documentId - Unique document identifier
- * @param {string} filename - Original filename
- * @param {string[]} chunks - Text chunks
- * @param {number[][]} embeddings - Embedding vectors
- * @returns {Promise<void>}
- */
+// Store document chunks with embeddings in search index
 async function storeInSearch(documentId, filename, chunks, embeddings) {
   const client = getSearchClient();
   
@@ -41,33 +34,47 @@ async function storeInSearch(documentId, filename, chunks, embeddings) {
     chunkSize: chunk.length,
     uploadDate: new Date().toISOString(),
     fileType: filename.split('.').pop().toLowerCase(),
-    hasContent: chunk.length > 0
-    // Note: contentVector field removed for Free tier compatibility
+    hasContent: chunk.length > 0,
+    vector: embeddings[index] || new Array(1536).fill(0) // Include vector embeddings
   }));
 
   try {
     await client.uploadDocuments(documents);
+    console.log(`✅ Stored ${documents.length} document chunks with vector embeddings`);
 
   } catch (error) {
     throw new Error(`Failed to store documents in search: ${error.message}`);
   }
 }
 
-/**
- * Search documents in Azure AI Search
- * @param {string} query - Search query
- * @param {number} topK - Number of results to return
- * @param {Object} filters - Search filters
- * @returns {Promise<Array>} - Search results
- */
-async function searchDocuments(query, topK = 5, filters = {}) {
+// Search documents with optional vector search
+async function searchDocuments(query, topK = 5, filters = {}, queryEmbedding = null) {
   const client = getSearchClient();
   
   const searchOptions = {
     top: topK,
-    select: ['id', 'documentId', 'filename', 'chunkIndex', 'content', 'chunkSize', 'uploadDate'],
-    orderBy: ['@search.score desc']
+    select: ['id', 'documentId', 'filename', 'chunkIndex', 'content', 'chunkSize', 'uploadDate', 'fileType']
   };
+
+  // Add filters if provided
+  if (Object.keys(filters).length > 0) {
+    searchOptions.filter = Object.entries(filters)
+      .map(([key, value]) => `${key} eq '${value}'`)
+      .join(' and ');
+  }
+
+  // If we have a query embedding, use vector search
+  if (queryEmbedding && Array.isArray(queryEmbedding)) {
+    searchOptions.vectorSearchOptions = {
+      queries: [{
+        kind: "vector",
+        vector: queryEmbedding,
+        fields: ["vector"],
+        kNearestNeighborsCount: topK
+      }]
+    };
+    console.log(`🔍 Performing vector search with ${queryEmbedding.length} dimensions`);
+  }
 
   try {
     const searchResults = await client.search(query, searchOptions);
@@ -80,10 +87,30 @@ async function searchDocuments(query, topK = 5, filters = {}) {
       });
     }
     
+    console.log(`✅ Found ${results.length} results using ${queryEmbedding ? 'vector' : 'text'} search`);
     return results;
   } catch (error) {
     throw new Error(`Failed to search documents: ${error.message}`);
   }
+}
+
+async function vectorSearch(queryEmbedding, topK = 5, filters = {}) {
+  if (!Array.isArray(queryEmbedding) || queryEmbedding.length !== 1536) {
+    throw new Error('Query embedding must be a 1536-dimensional vector');
+  }
+
+  return searchDocuments('', topK, filters, queryEmbedding);
+}
+
+/**
+ * Hybrid search combines text and vector search
+ */
+async function hybridSearch(query, queryEmbedding, topK = 5, filters = {}) {
+  if (!Array.isArray(queryEmbedding) || queryEmbedding.length !== 1536) {
+    throw new Error('Query embedding must be a 1536-dimensional vector');
+  }
+
+  return searchDocuments(query, topK, filters, queryEmbedding);
 }
 
 /**
@@ -92,12 +119,21 @@ async function searchDocuments(query, topK = 5, filters = {}) {
  */
 async function getIndexStats() {
   try {
-    // For Free tier, we'll return basic info since some APIs may not be available
+    const endpoint = process.env.AZURE_SEARCH_ENDPOINT;
+    const apiKey = process.env.AZURE_SEARCH_API_KEY;
+    const indexName = process.env.AZURE_SEARCH_INDEX_NAME;
+
+    const indexClient = new SearchIndexClient(endpoint, new AzureKeyCredential(apiKey));
+    const index = await indexClient.getIndex(indexName);
+    const stats = await indexClient.getIndexStatistics(indexName);
+    
     return {
-      tier: 'Free',
-      maxStorage: '50MB',
-      maxDocuments: '1000',
-      note: 'Vector search not available on Free tier'
+      name: index.name,
+      fields: index.fields.length,
+      vectorSearch: index.vectorSearch ? 'Enabled' : 'Disabled',
+      vectorFields: index.fields.filter(f => f.vectorSearchDimensions).length,
+      documentCount: stats.documentCount,
+      storageSize: stats.storageSize
     };
   } catch (error) {
     throw new Error(`Failed to get index stats: ${error.message}`);
@@ -107,6 +143,8 @@ async function getIndexStats() {
 module.exports = { 
   storeInSearch, 
   searchDocuments, 
+  vectorSearch,
+  hybridSearch,
   getIndexStats, 
   getSearchClient 
 }; 

@@ -1,11 +1,7 @@
 const axios = require('axios');
 require('dotenv').config();
 
-/**
- * Create embeddings for text chunks using OpenAI API
- * @param {string[]} chunks - Array of text chunks
- * @returns {Promise<number[][]>} - Array of embedding vectors
- */
+// Create embeddings using OpenAI API
 async function createEmbeddings(chunks) {
   const apiKey = process.env.OPENAI_API_KEY;
   

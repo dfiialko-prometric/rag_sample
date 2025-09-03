@@ -1,10 +1,6 @@
 const { RecursiveCharacterTextSplitter } = require('langchain/text_splitter');
 
-/**
- * Split text into semantic chunks using Langchain
- * @param {string} text - Text to chunk
- * @returns {Promise<string[]>} - Array of text chunks
- */
+// Split text into chunks using Langchain
 async function chunkText(text) {
   const textSplitter = new RecursiveCharacterTextSplitter({
     chunkSize: 1000,
@@ -17,11 +13,7 @@ async function chunkText(text) {
   return chunks.map(chunk => chunk.trim()).filter(chunk => chunk.length > 10);
 }
 
-/**
- * Get metadata for chunks
- * @param {string[]} chunks - Array of text chunks
- * @returns {Array} - Array of chunk metadata
- */
+// Get chunk metadata
 function getChunkMetadata(chunks) {
   return chunks.map((chunk, index) => ({
     chunkIndex: index,

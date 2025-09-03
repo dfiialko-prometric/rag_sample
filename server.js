@@ -2,7 +2,7 @@ const express = require('express');
 const path = require('path');
 const multer = require('multer');
 const fs = require('fs');
-const { processFile } = require('./process-and-upload');
+const axios = require('axios');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -23,12 +23,11 @@ app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// ========================================
-// TEMPORARY: LOCAL PROCESS AND UPLOAD ENDPOINT
-// ========================================
-// TODO: REMOVE WHEN SWITCHING BACK TO AZURE FUNCTIONS
-// ========================================
-app.post('/process-and-upload', upload.single('file'), async (req, res) => {
+// Azure Functions endpoints
+const AZURE_FUNCTION_BASE = 'https://rag-function-app-hmcdh9hddrbehkdv.canadacentral-01.azurewebsites.net/api';
+
+// Upload endpoint that forwards to Azure Functions
+app.post('/upload', upload.single('file'), async (req, res) => {
     try {
         if (!req.file) {
             return res.status(400).json({
@@ -37,24 +36,32 @@ app.post('/process-and-upload', upload.single('file'), async (req, res) => {
             });
         }
 
-        console.log(`Processing file: ${req.file.originalname}`);
+        console.log(`Uploading file: ${req.file.originalname}`);
 
-        // Process the uploaded file using our local process-and-upload script
-        const result = await processFile(req.file.path, req.file.originalname);
+        // Create form data for Azure Function
+        const FormData = require('form-data');
+        const formData = new FormData();
+        formData.append('document', fs.createReadStream(req.file.path), {
+            filename: req.file.originalname,
+            contentType: req.file.mimetype
+        });
+
+        // Forward to Azure Function
+        const response = await axios.post(`${AZURE_FUNCTION_BASE}/uploaddocuments`, formData, {
+            headers: {
+                ...formData.getHeaders(),
+            },
+            timeout: 120000 // 2 minutes timeout for processing
+        });
 
         // Clean up the temporary file
         fs.unlinkSync(req.file.path);
 
-        // Return success response
-        res.json({
-            success: true,
-            filename: req.file.originalname,
-            chunksProcessed: result.chunksProcessed || 1,
-            message: 'File processed and uploaded successfully'
-        });
+        // Return the Azure Function response
+        res.json(response.data);
 
     } catch (error) {
-        console.error('Error processing file:', error);
+        console.error('Error uploading file:', error);
         
         // Clean up the temporary file if it exists
         if (req.file && fs.existsSync(req.file.path)) {
@@ -63,18 +70,77 @@ app.post('/process-and-upload', upload.single('file'), async (req, res) => {
 
         res.status(500).json({
             success: false,
-            error: error.message || 'Failed to process file'
+            error: error.response?.data?.error || error.message || 'Failed to upload file'
         });
     }
 });
-// ========================================
-// END LOCAL PROCESS AND UPLOAD ENDPOINT
-// ========================================
+
+// Search endpoint that forwards to Azure Functions
+app.get('/search', async (req, res) => {
+    try {
+        const query = req.query.q;
+        const searchType = req.query.type || 'hybrid';
+        const top = req.query.top || 5;
+
+        if (!query) {
+            return res.status(400).json({
+                success: false,
+                error: 'Query parameter "q" is required'
+            });
+        }
+
+        console.log(`Searching for: "${query}" with type: ${searchType}`);
+
+        const response = await axios.get(`${AZURE_FUNCTION_BASE}/searchdocuments`, {
+            params: { q: query, type: searchType, top: top }
+        });
+
+        res.json(response.data);
+
+    } catch (error) {
+        console.error('Error searching:', error);
+        res.status(500).json({
+            success: false,
+            error: error.response?.data?.error || error.message || 'Search failed'
+        });
+    }
+});
+
+// Generate response endpoint that forwards to Azure Functions
+app.get('/ask', async (req, res) => {
+    try {
+        const question = req.query.question;
+
+        if (!question) {
+            return res.status(400).json({
+                success: false,
+                error: 'Question parameter is required'
+            });
+        }
+
+        console.log(`Generating response for: "${question}"`);
+
+        const response = await axios.get(`${AZURE_FUNCTION_BASE}/generateresponse`, {
+            params: { question: question }
+        });
+
+        res.json(response.data);
+
+    } catch (error) {
+        console.error('Error generating response:', error);
+        res.status(500).json({
+            success: false,
+            error: error.response?.data?.error || error.message || 'Failed to generate response'
+        });
+    }
+});
 
 // Start the server
 app.listen(PORT, () => {
     console.log(`RAG Web UI is running on http://localhost:${PORT}`);
-    console.log(`Local process-and-upload endpoint: http://localhost:${PORT}/process-and-upload`);
+    console.log(`Upload endpoint: http://localhost:${PORT}/upload`);
+    console.log(`Search endpoint: http://localhost:${PORT}/search`);
+    console.log(`Ask endpoint: http://localhost:${PORT}/ask`);
 });
 
 module.exports = app; 

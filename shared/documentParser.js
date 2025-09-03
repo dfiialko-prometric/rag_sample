@@ -3,23 +3,18 @@ const path = require('path');
 const pdfParse = require('pdf-parse');
 const mammoth = require('mammoth');
 
-/**
- * Parse a document file and extract plain text content
- * @param {string} filePath - Path to the document file
- * @returns {Promise<string>} - Extracted text content
- */
 async function parseDocument(filePath) {
   const ext = path.extname(filePath).toLowerCase();
   
   try {
     switch (ext) {
       case '.pdf':
-        return await parsePDF(filePath);
+        return { text: await parsePDF(filePath), type: 'application/pdf' };
       case '.docx':
       case '.doc':
-        return await parseWord(filePath);
+        return { text: await parseWord(filePath), type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' };
       case '.txt':
-        return await parseText(filePath);
+        return { text: await parseText(filePath), type: 'text/plain' };
       default:
         throw new Error(`Unsupported file type: ${ext}`);
     }
@@ -28,35 +23,41 @@ async function parseDocument(filePath) {
   }
 }
 
-/**
- * Parse PDF document
- * @param {string} filePath - Path to PDF file
- * @returns {Promise<string>} - Extracted text
- */
+async function parseDocumentContent(content, filename) {
+  const ext = path.extname(filename).toLowerCase();
+  
+  try {
+    switch (ext) {
+      case '.pdf':
+        throw new Error('PDF parsing from content not implemented yet');
+      case '.docx':
+      case '.doc':
+        throw new Error('Word document parsing from content not implemented yet');
+      case '.txt':
+      case '':
+        return { text: content, type: 'text/plain' };
+      default:
+        return { text: content, type: 'text/plain' };
+    }
+  } catch (error) {
+    throw new Error(`Failed to parse document: ${error.message}`);
+  }
+}
+
 async function parsePDF(filePath) {
   const dataBuffer = await fs.readFile(filePath);
   const data = await pdfParse(dataBuffer);
   return data.text;
 }
 
-/**
- * Parse Word document
- * @param {string} filePath - Path to Word file
- * @returns {Promise<string>} - Extracted text
- */
 async function parseWord(filePath) {
   const result = await mammoth.extractRawText({ path: filePath });
   return result.value;
 }
 
-/**
- * Parse text document
- * @param {string} filePath - Path to text file
- * @returns {Promise<string>} - Extracted text
- */
 async function parseText(filePath) {
   const data = await fs.readFile(filePath, 'utf8');
   return data;
 }
 
-module.exports = { parseDocument }; 
+module.exports = { parseDocument, parseDocumentContent }; 

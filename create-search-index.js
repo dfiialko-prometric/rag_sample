@@ -33,15 +33,15 @@ async function createSearchIndex() {
           name: 'documentId',
           type: 'Edm.String',
           searchable: false,
-          filterable: false,
-          sortable: false,
-          facetable: false,
+          filterable: true,
+          sortable: true,
+          facetable: true,
           retrievable: true
         },
         {
           name: 'filename',
           type: 'Edm.String',
-          searchable: false,
+          searchable: true,
           filterable: true,
           sortable: true,
           facetable: true,
@@ -50,7 +50,7 @@ async function createSearchIndex() {
         {
           name: 'chunkIndex',
           type: 'Edm.Int32',
-          searchable: true,
+          searchable: false,
           filterable: true,
           sortable: true,
           facetable: true,
@@ -60,8 +60,8 @@ async function createSearchIndex() {
           name: 'content',
           type: 'Edm.String',
           searchable: true,
-          filterable: true,
-          sortable: true,
+          filterable: false,
+          sortable: false,
           facetable: false,
           retrievable: true,
           analyzer: 'standard'
@@ -110,28 +110,38 @@ async function createSearchIndex() {
           sortable: false,
           facetable: false,
           retrievable: true,
-          dimensions: 1536,
-          vectorSearchProfile: 'default-vector-profile'
+          vectorSearchDimensions: 1536,
+          vectorSearchProfileName: 'default-vector-profile'
         }
       ],
       vectorSearch: {
-        algorithmConfigurations: [
+        algorithms: [
+          { 
+            name: 'myHnswAlgorithm', 
+            kind: 'hnsw' 
+          }
+        ],
+        profiles: [
           {
             name: 'default-vector-profile',
-            kind: 'hnsw'
+            algorithmConfigurationName: 'myHnswAlgorithm'
           }
         ]
       }
     };
 
     await client.createOrUpdateIndex(index);
-    console.log(`Search index '${indexName}' created successfully!`);
+    console.log(`✅ Search index '${indexName}' created successfully!`);
+    console.log(`🔍 Index endpoint: ${endpoint}`);
+    console.log(`📊 Vector dimensions: 1536 (OpenAI text-embedding-3-small)`);
+    console.log(`🚀 HNSW algorithm configured for fast vector search`);
     
   } catch (error) {
-    console.error('Failed to create search index:', error.message);
+    console.error('❌ Failed to create search index:', error.message);
     if (error.code === 'IndexAlreadyExists') {
-      console.log('ℹIndex already exists, no action needed.');
+      console.log('ℹ️ Index already exists, no action needed.');
     } else {
+      console.error('Full error:', error);
       process.exit(1);
     }
   }
