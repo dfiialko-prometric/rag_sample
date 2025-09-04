@@ -53,7 +53,7 @@ app.http('searchDocuments', {
           try {
             const queryEmbedding = await createEmbeddings([query || '']);
             results = await vectorSearch(queryEmbedding[0], topK, filters);
-            context.log(`✅ Vector search completed with ${results.length} results`);
+            context.log(`Vector search completed with ${results.length} results`);
           } catch (error) {
             context.error('Vector search error:', error);
             return {
@@ -72,7 +72,7 @@ app.http('searchDocuments', {
           try {
             const queryEmbedding = await createEmbeddings([query]);
             results = await hybridSearch(query, queryEmbedding[0], topK, filters);
-            context.log(`✅ Hybrid search completed with ${results.length} results`);
+            context.log(`Hybrid search completed with ${results.length} results`);
           } catch (error) {
             context.error('Hybrid search error:', error);
             return {
@@ -89,7 +89,7 @@ app.http('searchDocuments', {
         default:
           // Default to text search
           results = await searchDocuments(query, topK, filters);
-          context.log(`✅ Text search completed with ${results.length} results`);
+          context.log(`Text search completed with ${results.length} results`);
           break;
       }
 

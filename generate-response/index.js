@@ -60,9 +60,7 @@ app.http('generateResponse', {
         // Try hybrid search first (text + vector)
         const queryEmbedding = await createEmbeddings([userQuestion]);
         relevantDocs = await hybridSearch(userQuestion, queryEmbedding[0], maxResults);
-        context.log(`✅ Hybrid search found ${relevantDocs.length} relevant documents`);
       } catch (error) {
-        context.log(`⚠️ Hybrid search failed, falling back to text search: ${error.message}`);
         // Fallback to text search if vector search fails
         relevantDocs = await searchDocuments(userQuestion, maxResults);
       }

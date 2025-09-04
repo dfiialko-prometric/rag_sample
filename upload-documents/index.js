@@ -75,24 +75,16 @@ app.http('uploadDocuments', {
           const documentId = uuidv4();
           const filename = file.filename || `upload-${documentId}`;
           
-          context.log(`📄 Processing: ${filename} (${fileText.length} characters)`);
           
           // Parse the document
           const parsedDoc = await parseDocumentContent(fileText, filename);
-          context.log(`📄 Parsed document: ${typeof parsedDoc}, text length: ${parsedDoc.text?.length}`);
           
           // Create text chunks
-          context.log('🔍 Calling chunkText function...');
           const chunks = await chunkText(parsedDoc.text);
-          context.log(`📝 Chunking result: type=${typeof chunks}, isArray=${Array.isArray(chunks)}, length=${chunks?.length}`);
-          
+       
           // Generate embeddings
-          context.log('🔮 Creating embeddings...');
           const embeddings = await createEmbeddings(chunks);
-          context.log(`✨ Generated ${embeddings.length} embeddings`);
-          
-          // Store in Azure AI Search
-          context.log('💾 Storing in search index...');
+
           await storeInSearch(documentId, filename, chunks, embeddings);
           
           results.push({
@@ -104,7 +96,7 @@ app.http('uploadDocuments', {
             fileType: parsedDoc.type || 'text/plain'
           });
           
-          context.log(`✅ Successfully processed: ${filename}`);
+          context.log(`Successfully processed: ${filename}`);
           
         } catch (fileError) {
           context.error(`Error processing file ${file.filename}:`, fileError);
