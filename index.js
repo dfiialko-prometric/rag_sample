@@ -2,5 +2,6 @@
 require('./upload-documents/index.js');
 require('./search-documents/index.js');
 require('./generate-response/index.js');
+require('./sharepoint-sync/index.js');
 
  

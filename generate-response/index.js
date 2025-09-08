@@ -24,6 +24,12 @@ app.http('generateResponse', {
       }
 
       context.log('Starting to process question');
+      
+      // Debug: Check if OpenAI is configured
+      context.log('Environment check:', {
+        hasOpenAIKey: !!process.env.OPENAI_API_KEY,
+        keyLength: process.env.OPENAI_API_KEY?.length || 0
+      });
 
       let userQuestion, maxResults = 5;
 
@@ -90,7 +96,7 @@ app.http('generateResponse', {
         .join('\n\n');
 
       // Ask OpenAI to answer based on what we found
-      const aiAnswer = await getAnswerFromOpenAI(userQuestion, documentContent);
+      const aiAnswer = await getAnswerFromOpenAI(userQuestion, documentContent, relevantDocs);
 
       return {
         status: 200,
@@ -155,11 +161,11 @@ function extractUrlMappings(context) {
 }
 
 // Get an answer from OpenAI based on our document content
-async function getAnswerFromOpenAI(question, documentText) {
-  const apiKey = process.env.AZURE_OPENAI_API_KEY;
+async function getAnswerFromOpenAI(question, documentText, relevantDocs = []) {
+  const apiKey = process.env.OPENAI_API_KEY;
   
   if (!apiKey) {
-    return "I'm sorry, but I'm not configured to generate AI responses at the moment.";
+    return "I'm sorry, but OpenAI API key is not configured.";
   }
 
   try {
@@ -213,6 +219,10 @@ Answer:`;
     return response.data.choices[0].message.content;
 
   } catch (error) {
-    return "I'm sorry, but I encountered an error while generating the response. Please try again later.";
+    console.error('OpenAI API error:', error.response?.data || error.message);
+    if (error.response?.status === 401) {
+      return "OpenAI API authentication failed. Please check the API key configuration.";
+    }
+    return `I'm sorry, but I encountered an error while generating the response: ${error.message}`;
   }
 }
