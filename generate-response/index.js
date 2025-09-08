@@ -156,7 +156,7 @@ function extractUrlMappings(context) {
 
 // Get an answer from OpenAI based on our document content
 async function getAnswerFromOpenAI(question, documentText) {
-  const apiKey = process.env.OPENAI_API_KEY;
+  const apiKey = process.env.AZURE_OPENAI_API_KEY;
   
   if (!apiKey) {
     return "I'm sorry, but I'm not configured to generate AI responses at the moment.";
