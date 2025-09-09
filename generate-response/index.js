@@ -35,6 +35,57 @@ const CONFIG = {
   OPENAI_TIMEOUT: 30000
 };
 
+// Intent classification for query routing
+function classifyQuestionIntent(question) {
+  const qLower = question.toLowerCase().trim();
+
+  // 1. Greeting Intent
+  const greetings = ['hello', 'hi', 'hey', 'good morning', 'good afternoon', 'sup', 'greetings'];
+  if (greetings.includes(qLower)) {
+    return { 
+      intent: 'GREETING',
+      response: "Hello! How can I help you with your questions about our documents today?" 
+    };
+  }
+  
+  const thanks = ['thanks', 'thank you', 'thx', 'appreciate it', 'thank you very much'];
+  if (thanks.includes(qLower)) {
+    return {
+      intent: 'GREETING',
+      response: "You're welcome! Let me know if you have any other questions."
+    };
+  }
+
+  // 2. Meta-Question Intent
+  const metaRegex = /\b(what can you do|help|who are you|what do you know|what information do you have|what are you|capabilities|assist)\b/;
+  if (metaRegex.test(qLower)) {
+    return {
+      intent: 'META_QUESTION',
+      response: "I am an AI assistant designed to answer questions based on the documents you provide. You can ask me about policies, procedures, and other information contained in the knowledge base. Try asking me about specific topics like 'dress code', 'vacation policy', or 'company procedures'."
+    };
+  }
+
+  // 3. Out-of-Scope Intent
+  const outOfScopeRegex = /\b(password|hate|tell me a joke|weather|your opinion|stupid|fuck|shit|damn|bitch|asshole|kill|die|suicide|bomb|terrorist)\b/;
+  if (outOfScopeRegex.test(qLower)) {
+    return {
+      intent: 'OUT_OF_SCOPE',
+      response: "I can only answer questions based on the provided corporate documents. For other topics, please consult the appropriate resources or contact HR for assistance."
+    };
+  }
+
+  // 4. Empty or very short queries
+  if (qLower.length < 3) {
+    return {
+      intent: 'META_QUESTION',
+      response: "I need a more specific question to help you. Please ask me about policies, procedures, or other information from the documents."
+    };
+  }
+  
+  // 5. Default to Document Question
+  return { intent: 'DOCUMENT_QUESTION' };
+}
+
 // Tiny stable hash to dedupe near-identical snippets
 function hash(text) {
   let h = 0; 
@@ -166,7 +217,7 @@ function buildSnippets(filteredDocs, {
 const conversationMemory = new Map();
 
 // Parse and validate request
-function parseRequest(request) {
+async function parseRequest(request) {
   // Handle CORS preflight requests
   if (request.method === 'OPTIONS') {
     return {
@@ -198,7 +249,7 @@ function parseRequest(request) {
     maxResults = parseTop(request.query.get('top'));
   } else {
     // Get question from request body
-    requestBody = request.json().catch(() => ({}));
+    requestBody = await request.json().catch(() => ({}));
     userQuestion = requestBody?.question?.trim();
     maxResults = parseTop(requestBody?.top);
   }
@@ -499,6 +550,37 @@ app.http('generateResponse', {
       }
       
       const { userQuestion, maxResults, sessionId } = parseResult;
+      
+      // Step 1.5: Classify Intent and Handle Non-RAG questions
+      const classification = classifyQuestionIntent(userQuestion);
+
+      if (classification.intent !== 'DOCUMENT_QUESTION') {
+        context.log(`Handling as non-document question, intent: ${classification.intent}`);
+        
+        // For these simple cases, we can save the conversation and return immediately
+        saveConversation(sessionId, userQuestion, classification.response);
+
+        return {
+          status: 200,
+          headers: {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type'
+          },
+          jsonBody: {
+            success: true,
+            question: userQuestion,
+            response: classification.response,
+            sessionId: sessionId,
+            sources: [],
+            searchResults: 0,
+            intent: classification.intent
+          }
+        };
+      }
+      
+      // If we get here, it's a DOCUMENT_QUESTION, so proceed with the RAG pipeline
       context.log(`Looking for info about: "${userQuestion}"`);
 
       // Step 2: Fetch conversation state
