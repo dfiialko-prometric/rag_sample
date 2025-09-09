@@ -12,7 +12,7 @@ async function checkWithContentSafety(text) {
         const response = await client.path("/text:analyze").post({
             body: {
                 text: text,
-                categories: ["Hate", "Sexual", "SelfHarm", "Violence"],
+                categories: ["Credentials", "Confidential"],
             },
         });
         if (response.status !== "200") {
@@ -20,10 +20,8 @@ async function checkWithContentSafety(text) {
         }
         // Define thresholds
         const thresholds = {
-            Hate: 2,      // 0 = safe, 1 = low, 2 = medium, 3 = high
-            Sexual: 2,
-            SelfHarm: 2,
-            Violence: 2,
+            Credentials: 2,      // 0 = safe, 1 = low, 2 = medium, 3 = high
+            Confidential: 2,
         };
 
         // Check categories
@@ -31,6 +29,7 @@ async function checkWithContentSafety(text) {
         for (const result of analysis.categoriesAnalysis) {
             const category = result.category;
             const severity = result.severity;
+            console.log(`Category: ${category}, Severity: ${severity}`);
             if (severity >= thresholds[category]) {
                 console.warn(`Content flagged: ${category} severity ${severity}`);
                 return false;
