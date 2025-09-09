@@ -251,7 +251,8 @@ function showChatMessage(sender, content) {
     
     const contentDiv = document.createElement('div');
     contentDiv.className = 'message-content';
-    contentDiv.textContent = content;
+    // Convert newlines to <br> tags for proper formatting
+    contentDiv.innerHTML = content.replace(/\n/g, '<br>');
     
     bubbleDiv.appendChild(contentDiv);
     messageDiv.appendChild(bubbleDiv);

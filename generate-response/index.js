@@ -1,6 +1,7 @@
 const { app } = require('@azure/functions');
 const { searchDocuments, hybridSearch } = require('../shared/searchClient');
 const { createEmbeddings } = require('../shared/embeddings');
+const { filterDocumentsWithLLM } = require('../shared/relevanceFilter');
 const axios = require('axios');
 require('dotenv').config();
 
@@ -24,6 +25,12 @@ app.http('generateResponse', {
       }
 
       context.log('Starting to process question');
+      
+      // Debug: Check if OpenAI is configured
+      context.log('Environment check:', {
+        hasOpenAIKey: !!process.env.OPENAI_API_KEY,
+        keyLength: process.env.OPENAI_API_KEY?.length || 0
+      });
 
       let userQuestion, maxResults = 5;
 
@@ -65,7 +72,13 @@ app.http('generateResponse', {
         relevantDocs = await searchDocuments(userQuestion, maxResults);
       }
       
-      if (relevantDocs.length === 0) {
+      context.log(`Found ${relevantDocs.length} initial documents`);
+      
+      // Use smart LLM filtering to keep only relevant documents
+      const filteredDocs = await filterDocumentsWithLLM(userQuestion, relevantDocs);
+      context.log(`After LLM filtering: ${filteredDocs.length} relevant documents`);
+      
+      if (filteredDocs.length === 0) {
         return {
           status: 200,
           headers: {
@@ -84,13 +97,21 @@ app.http('generateResponse', {
         };
       }
 
-      // Pull together content from all the relevant docs
-      const documentContent = relevantDocs
+      // Pull together content from the filtered relevant docs
+      const documentContent = filteredDocs
         .map(doc => doc.document.content)
         .join('\n\n');
 
       // Ask OpenAI to answer based on what we found
-      const aiAnswer = await getAnswerFromOpenAI(userQuestion, documentContent);
+      const aiAnswer = await getAnswerFromOpenAI(userQuestion, documentContent, filteredDocs);
+
+      // Check if AI is asking for clarification or can't provide specific answer
+      const isNonSpecificAnswer = aiAnswer.toLowerCase().includes('more specific') || 
+                                  aiAnswer.toLowerCase().includes('additional details') || 
+                                  aiAnswer.toLowerCase().includes('please provide') ||
+                                  aiAnswer.toLowerCase().includes('not possible to determine') ||
+                                  aiAnswer.toLowerCase().includes('cannot determine') ||
+                                  aiAnswer.toLowerCase().includes('need more information');
 
       return {
         status: 200,
@@ -104,11 +125,11 @@ app.http('generateResponse', {
           success: true,
           question: userQuestion,
           response: aiAnswer,
-          sources: [...new Set(relevantDocs.map(doc => doc.document.filename))].map(filename => ({
+          sources: isNonSpecificAnswer ? [] : [...new Set(filteredDocs.map(doc => doc.document.filename))].map(filename => ({
             filename: filename,
-            count: relevantDocs.filter(doc => doc.document.filename === filename).length
+            count: filteredDocs.filter(doc => doc.document.filename === filename).length
           })),
-          searchResults: relevantDocs.length
+          searchResults: isNonSpecificAnswer ? 0 : filteredDocs.length
         }
       };
 
@@ -155,11 +176,11 @@ function extractUrlMappings(context) {
 }
 
 // Get an answer from OpenAI based on our document content
-async function getAnswerFromOpenAI(question, documentText) {
-  const apiKey = process.env.AZURE_OPENAI_API_KEY;
+async function getAnswerFromOpenAI(question, documentText, relevantDocs = []) {
+  const apiKey = process.env.OPENAI_API_KEY;
   
   if (!apiKey) {
-    return "I'm sorry, but I'm not configured to generate AI responses at the moment.";
+    return "I'm sorry, but OpenAI API key is not configured.";
   }
 
   try {
@@ -181,6 +202,13 @@ Guidelines:
 7. IMPORTANT: Only use information that is directly relevant to the question. Ignore irrelevant content even if it appears in the context
 8. For technical questions (URLs, systems, etc.), focus only on technical documents and ignore policy/dress code documents
 9. For policy questions (dress code, procedures, etc.), focus only on policy documents
+
+Formatting Requirements:
+- Use line breaks to separate different points or sections
+- For lists, use numbered or bulleted format
+- For URLs, put each on a separate line
+- Use proper paragraph breaks for readability
+- Structure your response with clear sections when appropriate
 
 Context:
 ${documentText}${urlInfo}
@@ -207,12 +235,17 @@ Answer:`;
       headers: {
         'Authorization': `Bearer ${apiKey}`,
         'Content-Type': 'application/json'
-      }
+      },
+      timeout: 30000 // 30 second timeout to prevent socket hang up
     });
 
     return response.data.choices[0].message.content;
 
   } catch (error) {
-    return "I'm sorry, but I encountered an error while generating the response. Please try again later.";
+    console.error('OpenAI API error:', error.response?.data || error.message);
+    if (error.response?.status === 401) {
+      return "OpenAI API authentication failed. Please check the API key configuration.";
+    }
+    return `I'm sorry, but I encountered an error while generating the response: ${error.message}`;
   }
 }

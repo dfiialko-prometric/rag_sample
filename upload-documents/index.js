@@ -63,25 +63,27 @@ app.http('uploadDocuments', {
         try {
           context.log(`Processing file: ${file.filename || 'unnamed'}`);
           
-          // Convert file data to text
-          const fileText = file.data.toString('utf-8');
-          
-          if (!fileText || fileText.trim().length === 0) {
-            context.log(`Skipping empty file: ${file.filename}`);
-            continue;
-          }
-          
           // Generate unique document ID
           const documentId = uuidv4();
           const filename = file.filename || `upload-${documentId}`;
           
-          
-          // Parse the document
-          const parsedDoc = await parseDocumentContent(fileText, filename);
+          // Parse the document directly from buffer (don't convert binary files to UTF-8)
+          const parsedDoc = await parseDocumentContent(file.data, filename);
           
           // Create text chunks
           const chunks = await chunkText(parsedDoc.text);
        
+          // Check if we have any chunks to process
+          if (chunks.length === 0) {
+            context.log(`No chunks created for ${filename} - text may be too short or filtered out`);
+            results.push({
+              filename: filename,
+              success: false,
+              error: 'No text chunks could be created from this document'
+            });
+            continue;
+          }
+
           // Generate embeddings
           const embeddings = await createEmbeddings(chunks);
 
@@ -92,7 +94,7 @@ app.http('uploadDocuments', {
             documentId: documentId,
             chunksCreated: chunks.length,
             embeddingsCreated: embeddings.length,
-            fileSize: fileText.length,
+            fileSize: file.data.length,
             fileType: parsedDoc.type || 'text/plain'
           });
           
