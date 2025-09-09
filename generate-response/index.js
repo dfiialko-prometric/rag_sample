@@ -245,6 +245,8 @@ ${docSummaries}
 INSTRUCTIONS:
 - Rank documents by how well they answer the user's specific question
 - Consider both filename and content relevance
+- Pay special attention to document chunks that contain specific policy details, rules, or procedures
+- If the question asks about a specific aspect (like "carry-over", "policy", "rules"), prioritize chunks that contain those specific terms
 - Ignore documents that are completely unrelated to the question topic
 - Return ONLY the numbers of the most relevant documents in order of relevance
 - Return exactly ${CONFIG.RERANK_FINAL_COUNT} document numbers, separated by commas
@@ -844,6 +846,8 @@ async function getAnswerFromOpenAI(question, snippets = [], conversationHistory 
 RULES:
 - CRITICAL: If the user asks about a specific topic but the provided snippets only discuss a related but different topic (e.g., the user asks about 'sick days' but the snippets only mention 'vacation days'), you MUST clearly state that you found information on the related topic but not the specific one requested. Offer to provide the information you did find.
 - CRITICAL: If the provided snippets are completely irrelevant to the user's question, you must state that you could not find any relevant information on that topic and briefly mention what topics the snippets actually discuss.
+- IMPORTANT: Look carefully for information that might be worded differently but answers the user's question. For example, "carry-over" might be described as "unused vacation days at the end of the fiscal year" or "accumulating unused vacation days".
+- CRITICAL: When users ask about "carry over" in the context of vacation days, look for information about "unused vacation days", "accumulating vacation days", "fiscal year ending", or similar terms that describe the same concept.
 - Include citation tags like [#id] for every factual claim.
 - If multiple snippets from the SAME document support a point, include multiple tags, e.g., [#2][#5].
 - Prefer consistency when snippets disagree: explain differences and cite both.
