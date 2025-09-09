@@ -14,8 +14,8 @@ const CONFIG = {
   ENTITY_SEARCH_LIMIT: 10,
   
   // Reranking parameters
-  RERANK_CANDIDATES: 30,  // Fetch more candidates for reranking
-  RERANK_FINAL_COUNT: 12, // Final count after reranking
+  RERANK_CANDIDATES: 25,  // Fetch more candidates for reranking (reduced for better performance)
+  RERANK_FINAL_COUNT: 10, // Final count after reranking (optimized for quality)
   
   // Document processing
   JIRA_SCORE_PENALTY: 0.05,
@@ -218,7 +218,7 @@ function buildSnippets(filteredDocs, {
 }
 
 // Reranking function to improve relevance and reduce noise
-async function rerankDocuments(documents, userQuestion, context) {
+async function rerankDocuments(documents, userQuestion, context, conversationHistory = []) {
   if (!documents || documents.length === 0) return documents;
   
   // If we have few documents, no need to rerank
@@ -235,15 +235,25 @@ async function rerankDocuments(documents, userQuestion, context) {
       return `${index + 1}. [${filename}] ${preview}`;
     }).join('\n\n');
     
-    const rerankPrompt = `You are a document relevance expert. Given a user question and a list of documents, rank them by relevance to the question.
+    // Build conversation context for better reranking
+    const recentHistory = conversationHistory.slice(-3).map(msg => 
+      `${msg.role.toUpperCase()}: ${String(msg.content || '').slice(0, 200)}`
+    ).join('\n');
+    
+    const contextualQuestion = recentHistory ? 
+      `RECENT CONVERSATION:\n${recentHistory}\n\nCURRENT QUESTION: "${userQuestion}"` : 
+      `USER QUESTION: "${userQuestion}"`;
 
-USER QUESTION: "${userQuestion}"
+    const rerankPrompt = `You are a document relevance expert. Given a user question (with conversation context) and a list of documents, rank them by relevance to the question.
+
+${contextualQuestion}
 
 DOCUMENTS TO RANK:
 ${docSummaries}
 
 INSTRUCTIONS:
 - Rank documents by how well they answer the user's specific question
+- Use the conversation context to understand vague references (e.g., "what about carry over?" following a vacation policy discussion)
 - Consider both filename and content relevance
 - Pay special attention to document chunks that contain specific policy details, rules, or procedures
 - If the question asks about a specific aspect (like "carry-over", "policy", "rules"), prioritize chunks that contain those specific terms
@@ -273,14 +283,33 @@ RANKED DOCUMENT NUMBERS:`;
       timeout: CONFIG.OPENAI_TIMEOUT
     });
 
-    const rankedIndices = response.data.choices[0].message.content
-      .trim()
+    const rawResponse = response.data.choices[0].message.content.trim();
+    
+    // Robust parsing of reranked indices
+    const rankedIndices = rawResponse
       .split(',')
-      .map(s => parseInt(s.trim()) - 1) // Convert to 0-based indices
+      .map(s => {
+        const num = parseInt(s.trim());
+        return isNaN(num) ? -1 : num - 1; // Convert to 0-based indices
+      })
       .filter(idx => idx >= 0 && idx < documents.length)
       .slice(0, CONFIG.RERANK_FINAL_COUNT);
 
     const rerankedDocs = rankedIndices.map(idx => documents[idx]).filter(Boolean);
+    
+    // Fallback if reranking didn't return enough results
+    if (rerankedDocs.length < CONFIG.RERANK_FINAL_COUNT / 2) {
+      context.log(`Reranking returned too few results (${rerankedDocs.length}), supplementing with original ranking`);
+      const needed = CONFIG.RERANK_FINAL_COUNT - rerankedDocs.length;
+      const usedIndices = new Set(rankedIndices);
+      const supplemental = documents
+        .slice(0, documents.length)
+        .map((doc, idx) => ({ doc, idx }))
+        .filter(({ idx }) => !usedIndices.has(idx))
+        .slice(0, needed)
+        .map(({ doc }) => doc);
+      rerankedDocs.push(...supplemental);
+    }
     
     context.log(`Reranking complete: selected ${rerankedDocs.length} most relevant documents`);
     return rerankedDocs;
@@ -680,7 +709,7 @@ app.http('generateResponse', {
       const relevantDocs = await fetchCandidates(userQuestion, context);
       
       // Step 3.5: Rerank documents for better relevance (reduce noise)
-      const rerankedDocs = await rerankDocuments(relevantDocs, userQuestion, context);
+      const rerankedDocs = await rerankDocuments(relevantDocs, userQuestion, context, conversationHistory);
       
       // Basic sanity logs
       const preview = rerankedDocs.slice(0, 12).map(d => ({
@@ -853,7 +882,8 @@ RULES:
 - Prefer consistency when snippets disagree: explain differences and cite both.
 - Return URLs ONLY if present verbatim in snippets.
 - Be concise and structured.
-- Use conversation history to understand context and references (like "one", "that", "it").
+- Use conversation history to understand context and references (like "one", "that", "it", "carry over").
+- If the current question is vague but conversation history provides context, interpret the question in that context.
 
 COLLABORATIVE RESPONSE EXAMPLES:
 - If user asks about "sick day carry-over policy" but snippets only discuss vacation policy, respond: "I could not find any specific information about the policy for carrying over sick days. However, I did find the policy for vacation days. Would you like to know about that?"
