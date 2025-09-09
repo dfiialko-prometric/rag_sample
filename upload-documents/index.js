@@ -7,6 +7,7 @@ const { parseDocumentContent } = require('../shared/documentParser');
 const { chunkText } = require('../shared/chunker');
 const { createEmbeddings } = require('../shared/embeddings');
 const { storeInSearch } = require('../shared/searchClient');
+const { checkWithContentSafety } = require('../shared/contentSafety');
 const { shouldCardize } = require('../shared/shouldCardize');
 const { cardize } = require('../shared/cardize');
 
@@ -16,7 +17,7 @@ app.http('uploadDocuments', {
   handler: async (request, context) => {
     try {
       context.log('Upload documents function started');
-      
+
       const contentType = request.headers.get('content-type') || '';
       
       if (!contentType.includes('multipart/form-data')) {
@@ -64,6 +65,21 @@ app.http('uploadDocuments', {
       for (const file of files) {
         try {
           context.log(`Processing file: ${file.filename || 'unnamed'}`);
+          
+          // Convert file data to text
+          const fileText = file.data.toString('utf-8');
+          
+          if (!fileText || fileText.trim().length === 0) {
+            context.log(`Skipping empty file: ${file.filename}`);
+            continue;
+          }
+
+          // Call Azure Content Safety API before parsing/chunking
+          const isSafe = await checkWithContentSafety(fileText);
+          if (!isSafe) {
+            context.log(`Sensitive content detected, skipping file: ${file.filename}`);
+            continue;
+          }
           
           // Generate unique document ID
           const documentId = uuidv4();
