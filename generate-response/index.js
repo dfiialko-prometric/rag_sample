@@ -13,9 +13,13 @@ const CONFIG = {
   CANDIDATES: 40,
   ENTITY_SEARCH_LIMIT: 10,
   
+  // Reranking parameters
+  RERANK_CANDIDATES: 30,  // Fetch more candidates for reranking
+  RERANK_FINAL_COUNT: 12, // Final count after reranking
+  
   // Document processing
   JIRA_SCORE_PENALTY: 0.05,
-  NON_JIRA_SCORE_BOOST: 5.0,
+  NON_JIRA_SCORE_BOOST: 1.5,
   TOP_RANKED_LIMIT: 20,
   LLM_CANDIDATES_LIMIT: 15,
   FINAL_SELECTION_LIMIT: 12,
@@ -211,6 +215,78 @@ function buildSnippets(filteredDocs, {
     section: s.section,
     text: s.text
   }));
+}
+
+// Reranking function to improve relevance and reduce noise
+async function rerankDocuments(documents, userQuestion, context) {
+  if (!documents || documents.length === 0) return documents;
+  
+  // If we have few documents, no need to rerank
+  if (documents.length <= CONFIG.RERANK_FINAL_COUNT) return documents;
+  
+  try {
+    context.log(`Reranking ${documents.length} documents for better relevance`);
+    
+    // Prepare document summaries for reranking
+    const docSummaries = documents.map((doc, index) => {
+      const content = doc.document.content || '';
+      const filename = doc.document.filename || '';
+      const preview = content.slice(0, 200) + (content.length > 200 ? '...' : '');
+      return `${index + 1}. [${filename}] ${preview}`;
+    }).join('\n\n');
+    
+    const rerankPrompt = `You are a document relevance expert. Given a user question and a list of documents, rank them by relevance to the question.
+
+USER QUESTION: "${userQuestion}"
+
+DOCUMENTS TO RANK:
+${docSummaries}
+
+INSTRUCTIONS:
+- Rank documents by how well they answer the user's specific question
+- Consider both filename and content relevance
+- Ignore documents that are completely unrelated to the question topic
+- Return ONLY the numbers of the most relevant documents in order of relevance
+- Return exactly ${CONFIG.RERANK_FINAL_COUNT} document numbers, separated by commas
+
+EXAMPLE OUTPUT: 3,1,7,2,5,8,4,6,9,11,10,12
+
+RANKED DOCUMENT NUMBERS:`;
+
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+      context.log('OpenAI API key not available, skipping reranking');
+      return documents.slice(0, CONFIG.RERANK_FINAL_COUNT);
+    }
+
+    const response = await axios.post('https://api.openai.com/v1/chat/completions', {
+      model: 'gpt-3.5-turbo',
+      messages: [
+        { role: 'user', content: rerankPrompt }
+      ],
+      max_tokens: 100,
+      temperature: 0.1
+    }, {
+      headers: { 'Authorization': `Bearer ${apiKey}` },
+      timeout: CONFIG.OPENAI_TIMEOUT
+    });
+
+    const rankedIndices = response.data.choices[0].message.content
+      .trim()
+      .split(',')
+      .map(s => parseInt(s.trim()) - 1) // Convert to 0-based indices
+      .filter(idx => idx >= 0 && idx < documents.length)
+      .slice(0, CONFIG.RERANK_FINAL_COUNT);
+
+    const rerankedDocs = rankedIndices.map(idx => documents[idx]).filter(Boolean);
+    
+    context.log(`Reranking complete: selected ${rerankedDocs.length} most relevant documents`);
+    return rerankedDocs;
+    
+  } catch (error) {
+    context.log(`Reranking failed: ${error.message}, using original ranking`);
+    return documents.slice(0, CONFIG.RERANK_FINAL_COUNT);
+  }
 }
 
 // Simple in-memory conversation storage (in production, use Redis or database)
@@ -446,10 +522,21 @@ function rankAndFilterDocuments(relevantDocs, userQuestion, context) {
     const hasIp = ipRx.test(content);
     const isJiraFile = determineIfJira(filename, content);
     
-    // Check for exact matches (must keep)
+    // Check for exact matches (must keep) - STRENGTHENED LOGIC
     const text = content.toLowerCase();
     const file = filename.toLowerCase();
-    const hasExactMatch = qTokens.some(w => text.includes(w) || file.includes(w)) ||
+    
+    // A stronger function to check for significant overlap
+    const hasSignificantMatch = (docText, queryTokens) => {
+      if (!docText || queryTokens.length === 0) return false;
+      const matches = queryTokens.filter(token => docText.includes(token));
+      const matchPercentage = matches.length / queryTokens.length;
+      // Require at least 50% of the query keywords to be in the document
+      return matchPercentage >= 0.5; 
+    };
+    
+    const hasExactMatch = hasSignificantMatch(text, qTokens) ||
+                         hasSignificantMatch(file, qTokens) ||
                          text.includes('nor (platform)') || text.includes('nor celpip') ||
                          text.includes('cael-registration.cael.ca');
     
@@ -457,18 +544,19 @@ function rankAndFilterDocuments(relevantDocs, userQuestion, context) {
     const lines = content.split('\n').map(s => s.trim()).filter(Boolean);
     const isCardChunk = isUrlQuery && lines.length <= 8 && (hasUrl || hasIp);
     
-    // Calculate adjusted score
+    // Calculate adjusted score - SIMPLIFIED: Trust the search engine more
     let adjustedScore = d.score || 0;
     if (isJiraFile) {
       adjustedScore *= CONFIG.JIRA_SCORE_PENALTY; // 5% of original score
     } else {
-      adjustedScore *= CONFIG.NON_JIRA_SCORE_BOOST; // 500% of original score
+      // Use the MODERATED boost we discussed before
+      adjustedScore *= CONFIG.NON_JIRA_SCORE_BOOST; // 1.5x boost (was 5.0x)
     }
     
-    // Apply content quality and file type adjustments
-    const contentQuality = getContentQualityScore(content);
-    const fileTypePriority = getFileTypePriority(filename);
-    adjustedScore *= contentQuality * fileTypePriority;
+    // REMOVED: Flawed heuristics that were causing noise
+    // const contentQuality = getContentQualityScore(content);
+    // const fileTypePriority = getFileTypePriority(filename);
+    // adjustedScore *= contentQuality * fileTypePriority;
 
     return {
       ...d, // original document and score
@@ -589,8 +677,11 @@ app.http('generateResponse', {
       // Step 3: Retrieve candidates
       const relevantDocs = await fetchCandidates(userQuestion, context);
       
+      // Step 3.5: Rerank documents for better relevance (reduce noise)
+      const rerankedDocs = await rerankDocuments(relevantDocs, userQuestion, context);
+      
       // Basic sanity logs
-      const preview = relevantDocs.slice(0, 12).map(d => ({
+      const preview = rerankedDocs.slice(0, 12).map(d => ({
         file: d.document.filename,
         hasNOR: /(^|\b)nor(\b|[^a-z])/i.test(d.document.content || ''),
         hasURL: /https?:\/\//i.test(d.document.content || '')
@@ -598,14 +689,14 @@ app.http('generateResponse', {
       context.log('retrievalPreview', JSON.stringify(preview, null, 2));
       
       const stats = {
-        total: relevantDocs.length,
-        anyNOR: relevantDocs.some(d => /(^|\b)nor(\b|[^a-z])/i.test(d.document.content || '')),
-        anyURL: relevantDocs.some(d => /https?:\/\//i.test(d.document.content || ''))
+        total: rerankedDocs.length,
+        anyNOR: rerankedDocs.some(d => /(^|\b)nor(\b|[^a-z])/i.test(d.document.content || '')),
+        anyURL: rerankedDocs.some(d => /https?:\/\//i.test(d.document.content || ''))
       };
       context.log('retrievalStats', stats);
 
       // Step 4: Rank and filter documents
-      const filteredDocs = rankAndFilterDocuments(relevantDocs, userQuestion, context);
+      const filteredDocs = rankAndFilterDocuments(rerankedDocs, userQuestion, context);
       
       if (filteredDocs.length === 0) {
         return {
@@ -751,13 +842,19 @@ async function getAnswerFromOpenAI(question, snippets = [], conversationHistory 
     const systemPrompt = `You are a corporate HR/RAG assistant.
 
 RULES:
-- CRITICAL: If the snippets discuss a similar topic but a different specific subject (e.g., user asks about "sick days" but snippets only mention "vacation days"), you MUST state that you found information on the related topic but not the specific one requested. DO NOT invent an answer for the user's original question.
+- CRITICAL: If the user asks about a specific topic but the provided snippets only discuss a related but different topic (e.g., the user asks about 'sick days' but the snippets only mention 'vacation days'), you MUST clearly state that you found information on the related topic but not the specific one requested. Offer to provide the information you did find.
+- CRITICAL: If the provided snippets are completely irrelevant to the user's question, you must state that you could not find any relevant information on that topic and briefly mention what topics the snippets actually discuss.
 - Include citation tags like [#id] for every factual claim.
 - If multiple snippets from the SAME document support a point, include multiple tags, e.g., [#2][#5].
 - Prefer consistency when snippets disagree: explain differences and cite both.
 - Return URLs ONLY if present verbatim in snippets.
 - Be concise and structured.
 - Use conversation history to understand context and references (like "one", "that", "it").
+
+COLLABORATIVE RESPONSE EXAMPLES:
+- If user asks about "sick day carry-over policy" but snippets only discuss vacation policy, respond: "I could not find any specific information about the policy for carrying over sick days. However, I did find the policy for vacation days. Would you like to know about that?"
+- If user asks about "remote work policy" but snippets discuss only office procedures, respond: "I couldn't find information about remote work policies. The available documents focus on office procedures and in-person work requirements. Would you like to know about the office procedures instead?"
+- If user asks about "maternity leave" but snippets discuss vacation policy, respond: "I couldn't find specific information about maternity leave policies. However, I did find detailed information about vacation policies. Would you like to know about vacation leave instead?"
 
 If the answer is under-specified, start with: "I need more context to answer precisely."
 
