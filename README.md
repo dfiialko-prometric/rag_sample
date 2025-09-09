@@ -10,6 +10,7 @@ A Retrieval-Augmented Generation (RAG) system built with Azure Functions, Azure 
 - Hybrid Search: Combine text and vector search for optimal results
 - Semantic Search: Find relevant content using vector similarit
 - AI Response Generation: Generate contextual responses using retrieved content
+- Content Safety: Azure Content Safety integration for sensitive content detection
 - Serverless Architecture: Built on Azure Functions for scalability
 
 ## Architecture
@@ -93,6 +94,10 @@ AZURE_OPENAI_API_KEY=your-azure-openai-key
 AZURE_OPENAI_DEPLOYMENT_NAME=your-embedding-deployment
 AZURE_OPENAI_CHAT_DEPLOYMENT_NAME=your-chat-deployment
 
+# Azure Content Safety (Recommended for Production)
+AZURE_CONTENT_SAFETY_ENDPOINT=https://your-content-safety.cognitiveservices.azure.com/
+AZURE_CONTENT_SAFETY_KEY=your-content-safety-key
+
 # Azure Function Configuration
 AZURE_FUNCTION_URL=https://your-function-app.azurewebsites.net
 ```
@@ -166,11 +171,30 @@ curl "http://localhost:7071/api/generateResponse?question=What is this about?"
 └── index.js                 # Function registration
 ```
 
+## Content Safety
+
+The system includes Azure Content Safety integration to automatically detect and filter sensitive content during document upload. This helps ensure that confidential or inappropriate content is not processed or stored in the search index.
+
+### Features:
+- Automatic content scanning during document upload
+- Detection of credentials and confidential information
+- Configurable severity thresholds
+- Graceful handling of API failures
+
+### Configuration:
+Set the following environment variables:
+```env
+AZURE_CONTENT_SAFETY_ENDPOINT=https://your-content-safety.cognitiveservices.azure.com/
+AZURE_CONTENT_SAFETY_KEY=your-content-safety-key
+```
+
 ## Dependencies
 
 - @azure/functions: Azure Functions v4 runtime
 - @azure/search-documents: Azure AI Search client
 - @azure/openai: Azure OpenAI client
+- @azure-rest/ai-content-safety: Azure Content Safety client
+- @azure/core-auth: Azure authentication utilities
 - langchain: Text chunking and processing
 - pdf-parse: PDF document parsing
 - mammoth: Word document parsing
