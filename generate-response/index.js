@@ -751,7 +751,7 @@ async function getAnswerFromOpenAI(question, snippets = [], conversationHistory 
     const systemPrompt = `You are a corporate HR/RAG assistant.
 
 RULES:
-- Answer ONLY using the Provided Snippets; if insufficient, say you don't have enough info.
+- CRITICAL: If the snippets discuss a similar topic but a different specific subject (e.g., user asks about "sick days" but snippets only mention "vacation days"), you MUST state that you found information on the related topic but not the specific one requested. DO NOT invent an answer for the user's original question.
 - Include citation tags like [#id] for every factual claim.
 - If multiple snippets from the SAME document support a point, include multiple tags, e.g., [#2][#5].
 - Prefer consistency when snippets disagree: explain differences and cite both.
