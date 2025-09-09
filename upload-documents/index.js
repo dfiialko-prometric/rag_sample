@@ -8,6 +8,8 @@ const { chunkText } = require('../shared/chunker');
 const { createEmbeddings } = require('../shared/embeddings');
 const { storeInSearch } = require('../shared/searchClient');
 const { checkWithContentSafety } = require('../shared/contentSafety');
+const { shouldCardize } = require('../shared/shouldCardize');
+const { cardize } = require('../shared/cardize');
 
 app.http('uploadDocuments', {
   methods: ['POST'],
@@ -83,24 +85,59 @@ app.http('uploadDocuments', {
           const documentId = uuidv4();
           const filename = file.filename || `upload-${documentId}`;
           
+          // Parse the document directly from buffer (don't convert binary files to UTF-8)
+          const parsedDoc = await parseDocumentContent(file.data, filename);
           
-          // Parse the document
-          const parsedDoc = await parseDocumentContent(fileText, filename);
+          // Check if document should be cardized (entity-attribute patterns)
+          const text = parsedDoc.text || '';
+          const makeCards = shouldCardize(text);
+          const cards = makeCards ? cardize(text) : [];
           
-          // Create text chunks
-          const chunks = await chunkText(parsedDoc.text);
+          // Create card chunks from structured entities
+          const cardChunks = cards.map(c => 
+            [c.name, c.host, c.ip, c.url].filter(Boolean).join('\n')
+          );
+          
+          // Create regular text chunks
+          const textChunks = await chunkText(text);
+          
+          // Combine all chunks
+          const chunks = [...textChunks, ...cardChunks];
        
+          // Check if we have any chunks to process
+          if (chunks.length === 0) {
+            context.log(`No chunks created for ${filename} - text may be too short or filtered out`);
+            results.push({
+              filename: filename,
+              success: false,
+              error: 'No text chunks could be created from this document'
+            });
+            continue;
+          }
+
           // Generate embeddings
           const embeddings = await createEmbeddings(chunks);
 
-          await storeInSearch(documentId, filename, chunks, embeddings);
+          // Prepare metadata with card information
+          const metadata = {
+            services: cards.map(c => c.name),
+            urls: cards.map(c => c.url).filter(Boolean),
+            ips: cards.map(c => c.ip).filter(Boolean),
+            hosts: cards.map(c => c.host).filter(Boolean),
+            uploadedAt: new Date().toISOString(),
+            chunkTypes: chunks.map((_, i) => i >= textChunks.length ? 'card' : 'raw')
+          };
+
+          await storeInSearch(documentId, filename, chunks, embeddings, metadata);
           
           results.push({
             filename: filename,
             documentId: documentId,
             chunksCreated: chunks.length,
+            cardChunksCreated: cardChunks.length,
+            cardsExtracted: cards.length,
             embeddingsCreated: embeddings.length,
-            fileSize: fileText.length,
+            fileSize: file.data.length,
             fileType: parsedDoc.type || 'text/plain'
           });
           

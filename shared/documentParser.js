@@ -29,15 +29,15 @@ async function parseDocumentContent(content, filename) {
   try {
     switch (ext) {
       case '.pdf':
-        throw new Error('PDF parsing from content not implemented yet');
+        return { text: await parsePDFFromBuffer(content), type: 'application/pdf' };
       case '.docx':
       case '.doc':
-        throw new Error('Word document parsing from content not implemented yet');
+        return { text: await parseWordFromBuffer(content), type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' };
       case '.txt':
       case '':
-        return { text: content, type: 'text/plain' };
+        return { text: content.toString(), type: 'text/plain' };
       default:
-        return { text: content, type: 'text/plain' };
+        return { text: content.toString(), type: 'text/plain' };
     }
   } catch (error) {
     throw new Error(`Failed to parse document: ${error.message}`);
@@ -58,6 +58,22 @@ async function parseWord(filePath) {
 async function parseText(filePath) {
   const data = await fs.readFile(filePath, 'utf8');
   return data;
+}
+
+async function parsePDFFromBuffer(buffer) {
+  try {
+    // Convert string back to buffer if needed
+    const actualBuffer = typeof buffer === 'string' ? Buffer.from(buffer, 'utf-8') : buffer;
+    const data = await pdfParse(actualBuffer);
+    return data.text;
+  } catch (error) {
+    throw error;
+  }
+}
+
+async function parseWordFromBuffer(buffer) {
+  const result = await mammoth.extractRawText({ buffer: buffer });
+  return result.value;
 }
 
 module.exports = { parseDocument, parseDocumentContent }; 
