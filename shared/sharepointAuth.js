@@ -21,7 +21,11 @@ async function getLoginUrl() {
     const msalInstance = createMSALInstance();
     
     const authCodeUrlParameters = {
-      scopes: ['https://graph.microsoft.com/User.Read'],
+      scopes: [
+        'https://graph.microsoft.com/User.Read',
+        'https://graph.microsoft.com/Sites.Read.All',
+        'https://graph.microsoft.com/Files.Read.All'
+      ],
       redirectUri: 'https://rag-function-app-hmcdh9hddrbehkdv.canadacentral-01.azurewebsites.net/api/sharepointsync'
     };
     
@@ -39,7 +43,11 @@ async function getAccessTokenFromCode(authCode) {
     
     const tokenRequest = {
       code: authCode,
-      scopes: ['https://graph.microsoft.com/User.Read'],
+      scopes: [
+        'https://graph.microsoft.com/User.Read',
+        'https://graph.microsoft.com/Sites.Read.All',
+        'https://graph.microsoft.com/Files.Read.All'
+      ],
       redirectUri: 'https://rag-function-app-hmcdh9hddrbehkdv.canadacentral-01.azurewebsites.net/api/sharepointsync'
     };
     
