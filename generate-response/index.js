@@ -192,9 +192,29 @@ app.http('generateResponse', {
       
       context.log(`Found ${relevantDocs.length} initial documents`);
       
+      // Positive pre-filter: never drop exact matches
+      const q = userQuestion.toLowerCase();
+      const mustKeep = relevantDocs.filter(d => {
+        const t = (d.document.content || '').toLowerCase();
+        const f = (d.document.filename || '').toLowerCase();
+        return t.includes(q) || f.includes(q) || 
+               q.includes('nor') && (t.includes('nor') || f.includes('nor'));
+      });
+      context.log(`Found ${mustKeep.length} exact matches that must be kept`);
+
       // Use smart LLM filtering to keep only relevant documents
-      const filteredDocs = await filterDocumentsWithLLM(userQuestion, relevantDocs);
+      let filteredDocs = await filterDocumentsWithLLM(userQuestion, relevantDocs);
       context.log(`After LLM filtering: ${filteredDocs.length} relevant documents`);
+      
+      // Merge exact matches with LLM filtered results (dedupe by document ID)
+      const allDocs = [...filteredDocs];
+      for (const exactDoc of mustKeep) {
+        const exists = allDocs.some(d => d.document.id === exactDoc.document.id);
+        if (!exists) {
+          allDocs.push(exactDoc);
+        }
+      }
+      filteredDocs = allDocs;
       
       if (filteredDocs.length === 0) {
         return {
@@ -295,27 +315,36 @@ app.http('generateResponse', {
   }
 });
 
-/**
- * Extract URL mappings from context to improve AI accuracy
- */
-function extractUrlMappings(context) {
-  const lines = context.split('\n');
-  const urlMappings = [];
-  
-  for (let i = 0; i < lines.length - 1; i++) {
-    const currentLine = lines[i].trim();
-    const nextLine = lines[i + 1].trim();
-    
-    // If current line looks like a service name and next line is a URL
-    if (currentLine && nextLine.startsWith('https://')) {
-      urlMappings.push({
-        service: currentLine,
-        url: nextLine
-      });
+
+function extractLinksAndIps(text) {
+  if (!text) return { pairs: [], urls: [], ips: [] };
+
+  const lines = String(text).split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+
+  const urlRx = /\bhttps?:\/\/[^\s)]+/gi;
+  const ipRx  = /\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b/g;
+
+  const urls = [...new Set((text.match(urlRx) || []))];
+  const ips  = [...new Set((text.match(ipRx) || []))];
+
+  // Heuristic: a "service name" line is short and has letters (like "NOR (Platform)")
+  const nameRx = /^[A-Za-z][A-Za-z0-9() ._-]{2,60}$/;
+
+  // Pair names with the closest following URL/IP within 3 lines
+  const pairs = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (!nameRx.test(lines[i])) continue;
+    for (let j = 1; j <= 3 && i + j < lines.length; j++) {
+      const u = (lines[i + j].match(urlRx) || [])[0];
+      const ip = (lines[i + j].match(ipRx) || [])[0];
+      if (u || ip) {
+        pairs.push({ service: lines[i], url: u || null, ip: ip || null });
+        break;
+      }
     }
   }
-  
-  return urlMappings;
+
+  return { pairs, urls, ips };
 }
 
 // Get an answer from OpenAI based on structured snippets
@@ -327,11 +356,11 @@ async function getAnswerFromOpenAI(question, snippets = [], conversationHistory 
   }
 
   try {
-    // Extract URLs from all snippets
+    // Extract URLs and IPs from all snippets
     const allText = snippets.map(s => s.text).join('\n');
-    const urlMappings = extractUrlMappings(allText);
-    const urlsBlock = urlMappings.length > 0
-      ? `\n\nURLs found in context:\n${urlMappings.map(m => `- ${m.service}: ${m.url}`).join('\n')}`
+    const linkData = extractLinksAndIps(allText);
+    const urlsBlock = linkData.pairs.length > 0
+      ? `\n\nServices found in context:\n${linkData.pairs.map(p => `- ${p.service}: ${p.url || p.ip || 'N/A'}`).join('\n')}`
       : '';
 
     // Build conversation context

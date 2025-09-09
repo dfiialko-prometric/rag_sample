@@ -53,7 +53,10 @@ async function searchDocuments(query, topK = 5, filters = {}, queryEmbedding = n
   
   const searchOptions = {
     top: topK,
-    select: ['id', 'documentId', 'filename', 'chunkIndex', 'content', 'chunkSize', 'uploadDate', 'fileType']
+    select: ['id', 'documentId', 'filename', 'chunkIndex', 'content', 'chunkSize', 'uploadDate', 'fileType'],
+    searchFields: ['content^3', 'filename^2'], // Boost content 3x, filename 2x
+    queryType: 'simple',
+    searchMode: 'any'
   };
 
   // Add filters if provided
