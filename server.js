@@ -121,7 +121,10 @@ app.get('/ask', async (req, res) => {
         console.log(`Generating response for: "${question}"`);
 
         const response = await axios.get(`${AZURE_FUNCTION_BASE}/generateresponse`, {
-            params: { question: question }
+            params: { 
+                question: question,
+                sessionId: req.query.sessionId || 'default'
+            }
         });
 
         res.json(response.data);

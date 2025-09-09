@@ -5,6 +5,94 @@ const { filterDocumentsWithLLM } = require('../shared/relevanceFilter');
 const axios = require('axios');
 require('dotenv').config();
 
+// Tiny stable hash to dedupe near-identical snippets
+function hash(text) {
+  let h = 0; 
+  for (let i = 0; i < text.length; i++) { 
+    h = (h * 31 + text.charCodeAt(i)) | 0; 
+  }
+  return h >>> 0;
+}
+
+
+function buildSnippets(filteredDocs, {
+  maxSnippets = 8,
+  perDocCap = 2,            // avoid one doc flooding the prompt
+  maxCharsPerSnippet = 1000,
+  minChars = 120,           // skip super-tiny stuff
+  promoteDiversity = true,  // round-robin across docs
+} = {}) {
+  // 1) Preprocess: trim, clamp, annotate, hash
+  const prepared = filteredDocs.map((d, idx) => {
+    const text = String(d.document.content || '').trim();
+    const short = text.slice(0, maxCharsPerSnippet);
+    return {
+      origIndex: idx,
+      filename: d.document.filename || 'unknown',
+      page: d.document.pageNumber ?? null,
+      section: d.document.section ?? null,
+      score: d.score ?? 0,
+      text: short,
+      hash: hash(short),
+    };
+  }).filter(s => s.text.length >= minChars);
+
+  // 2) Deduplicate by hash (keep best score per hash)
+  const byHash = new Map();
+  for (const s of prepared) {
+    const existing = byHash.get(s.hash);
+    if (!existing || s.score > existing.score) byHash.set(s.hash, s);
+  }
+  const deduped = Array.from(byHash.values());
+
+  // 3) Group by filename to enforce per-doc cap
+  const buckets = new Map();
+  for (const s of deduped) {
+    if (!buckets.has(s.filename)) buckets.set(s.filename, []);
+    buckets.get(s.filename).push(s);
+  }
+  // Sort each bucket by score desc (if you have scores)
+  for (const arr of buckets.values()) arr.sort((a, b) => (b.score - a.score));
+
+  // 4) Select with diversity: round-robin across files
+  const selections = [];
+  if (promoteDiversity) {
+    let addedSomething = true;
+    let round = 0;
+    while (selections.length < maxSnippets && addedSomething) {
+      addedSomething = false;
+      for (const [filename, arr] of buckets) {
+        const taken = selections.filter(x => x.filename === filename).length;
+        if (taken >= perDocCap) continue;
+        if (round < arr.length) {
+          selections.push(arr[round]);
+          addedSomething = true;
+          if (selections.length >= maxSnippets) break;
+        }
+      }
+      round++;
+    }
+  } else {
+    // Simple global top-k after perDocCap
+    const flat = [];
+    for (const arr of buckets.values()) flat.push(...arr.slice(0, perDocCap));
+    flat.sort((a, b) => (b.score - a.score));
+    selections.push(...flat.slice(0, maxSnippets));
+  }
+
+  // 5) Assign stable snippet ids and labels
+  return selections.map((s, i) => ({
+    id: i + 1,
+    filename: s.filename,
+    page: s.page,
+    section: s.section,
+    text: s.text
+  }));
+}
+
+// Simple in-memory conversation storage (in production, use Redis or database)
+const conversationMemory = new Map();
+
 app.http('generateResponse', {
   methods: ['GET', 'POST', 'OPTIONS'],
   authLevel: 'anonymous',
@@ -26,51 +114,81 @@ app.http('generateResponse', {
 
       context.log('Starting to process question');
       
-      // Debug: Check if OpenAI is configured
-      context.log('Environment check:', {
-        hasOpenAIKey: !!process.env.OPENAI_API_KEY,
-        keyLength: process.env.OPENAI_API_KEY?.length || 0
-      });
+      // Input validation and capping
+      const MAX_RESULTS_HARD = 8;
+      const parseTop = (v) => {
+        const n = Number(v);
+        return Number.isInteger(n) && n >= 1 && n <= MAX_RESULTS_HARD ? n : 5;
+      };
 
-      let userQuestion, maxResults = 5;
+      let userQuestion, maxResults = 5, requestBody = {};
 
       if (request.method === 'GET') {
         // Get question from URL params
-        userQuestion = request.query.get('question');
-        const numResults = request.query.get('top');
-        if (numResults) {
-          maxResults = parseInt(numResults);
-        }
+        userQuestion = request.query.get('question')?.trim();
+        maxResults = parseTop(request.query.get('top'));
       } else {
         // Get question from request body
-        const requestBody = await request.json();
-        userQuestion = requestBody.question;
-        maxResults = requestBody.top || 5;
+        requestBody = await request.json().catch(() => ({}));
+        userQuestion = requestBody?.question?.trim();
+        maxResults = parseTop(requestBody?.top);
       }
 
       if (!userQuestion) {
         return {
           status: 400,
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
+          jsonBody: {
             success: false,
             error: 'Question parameter is required'
-          })
+          }
         };
+      }
+
+      // Get session ID for conversation memory
+      const sessionId = requestBody?.sessionId || request.query.get('sessionId') || 'default';
+      
+      // Get conversation history for this session
+      if (!conversationMemory.has(sessionId)) {
+        conversationMemory.set(sessionId, []);
+      }
+      const conversationHistory = conversationMemory.get(sessionId);
+
+      // Check if this is a follow-up question about vacation (common pattern)
+      const isVacationFollowUp = conversationHistory.length > 0 && 
+        conversationHistory.some(msg => msg.content.toLowerCase().includes('vacation')) &&
+        (userQuestion.toLowerCase().includes('how do i request') || 
+         userQuestion.toLowerCase().includes('how can i request') ||
+         userQuestion.toLowerCase().includes('request one') ||
+         userQuestion.toLowerCase().includes('how to request'));
+      
+      if (isVacationFollowUp) {
+        // Force search for vacation request procedures
+        userQuestion = 'vacation request procedure how to request vacation time';
+        context.log(`Detected vacation follow-up question, searching for: "${userQuestion}"`);
       }
 
       context.log(`Looking for info about: "${userQuestion}"`);
 
       // Find documents that might have the answer using hybrid search
-      let relevantDocs;
+      let relevantDocs = [];
       try {
         // Try hybrid search first (text + vector)
         const queryEmbedding = await createEmbeddings([userQuestion]);
         relevantDocs = await hybridSearch(userQuestion, queryEmbedding[0], maxResults);
       } catch (error) {
-        // Fallback to text search if vector search fails
-        relevantDocs = await searchDocuments(userQuestion, maxResults);
+        context.log('Hybrid search failed, trying text search:', error.message);
+        try {
+          // Fallback to text search if vector search fails
+          relevantDocs = await searchDocuments(userQuestion, maxResults);
+        } catch (e2) {
+          context.error('All search strategies failed', e2);
+          relevantDocs = [];
+        }
       }
+      
+      // Ensure relevantDocs is always an array
+      relevantDocs = Array.isArray(relevantDocs) ? relevantDocs : [];
       
       context.log(`Found ${relevantDocs.length} initial documents`);
       
@@ -97,13 +215,34 @@ app.http('generateResponse', {
         };
       }
 
-      // Pull together content from the filtered relevant docs
-      const documentContent = filteredDocs
-        .map(doc => doc.document.content)
-        .join('\n\n');
+      // Build enhanced snippets with deduplication and diversity
+      const snippets = buildSnippets(filteredDocs, {
+        maxSnippets: Math.min(8, maxResults),
+        perDocCap: 3, // Allow more from same doc if corpus is small
+        maxCharsPerSnippet: 1000,
+        minChars: 120,
+        promoteDiversity: true
+      });
 
-      // Ask OpenAI to answer based on what we found
-      const aiAnswer = await getAnswerFromOpenAI(userQuestion, documentContent, filteredDocs);
+      // Ask OpenAI to answer based on structured snippets
+      const aiAnswer = await getAnswerFromOpenAI(userQuestion, snippets, conversationHistory);
+
+      // Store conversation in memory
+      conversationHistory.push({
+        role: 'user',
+        content: userQuestion,
+        timestamp: new Date().toISOString()
+      });
+      conversationHistory.push({
+        role: 'assistant', 
+        content: aiAnswer,
+        timestamp: new Date().toISOString()
+      });
+
+      // Keep only last 10 messages to prevent memory bloat
+      if (conversationHistory.length > 10) {
+        conversationHistory.splice(0, conversationHistory.length - 10);
+      }
 
       // Check if AI is asking for clarification or can't provide specific answer
       const isNonSpecificAnswer = aiAnswer.toLowerCase().includes('more specific') || 
@@ -125,9 +264,13 @@ app.http('generateResponse', {
           success: true,
           question: userQuestion,
           response: aiAnswer,
-          sources: isNonSpecificAnswer ? [] : [...new Set(filteredDocs.map(doc => doc.document.filename))].map(filename => ({
-            filename: filename,
-            count: filteredDocs.filter(doc => doc.document.filename === filename).length
+          sessionId: sessionId,
+          sources: isNonSpecificAnswer ? [] : snippets.map(s => ({
+            id: s.id,
+            filename: s.filename,
+            page: s.page,
+            section: s.section,
+            preview: s.text.slice(0, 200) + (s.text.length > 200 ? '...' : '')
           })),
           searchResults: isNonSpecificAnswer ? 0 : filteredDocs.length
         }
@@ -175,8 +318,8 @@ function extractUrlMappings(context) {
   return urlMappings;
 }
 
-// Get an answer from OpenAI based on our document content
-async function getAnswerFromOpenAI(question, documentText, relevantDocs = []) {
+// Get an answer from OpenAI based on structured snippets
+async function getAnswerFromOpenAI(question, snippets = [], conversationHistory = []) {
   const apiKey = process.env.OPENAI_API_KEY;
   
   if (!apiKey) {
@@ -184,53 +327,85 @@ async function getAnswerFromOpenAI(question, documentText, relevantDocs = []) {
   }
 
   try {
-    // See if we can find any URL mappings to help with URL questions
-    const urlMappings = extractUrlMappings(documentText);
-    const urlInfo = urlMappings.length > 0 && question.toLowerCase().includes('url')
-      ? `\n\nAvailable URLs:\n${urlMappings.map(m => `${m.service}: ${m.url}`).join('\n')}`
+    // Extract URLs from all snippets
+    const allText = snippets.map(s => s.text).join('\n');
+    const urlMappings = extractUrlMappings(allText);
+    const urlsBlock = urlMappings.length > 0
+      ? `\n\nURLs found in context:\n${urlMappings.map(m => `- ${m.service}: ${m.url}`).join('\n')}`
       : '';
 
-    const systemPrompt = `Based on the following context from company documents, please answer the question accurately and completely.
+    // Build conversation context
+    const historyBlock = conversationHistory.slice(-6).map(msg => {
+      const short = String(msg.content || '').slice(0, 600);
+      return `${msg.role.toUpperCase()}: ${short}`;
+    }).join('\n');
 
-Guidelines:
-1. Use only information provided in the context
-2. Be specific and cite relevant details from the documents
-3. If the context doesn't contain enough information, say so clearly
-4. For policy questions, provide the exact policy details as stated
-5. For URL requests, match service names precisely
-6. If there are multiple relevant sections, summarize all relevant information
-7. IMPORTANT: Only use information that is directly relevant to the question. Ignore irrelevant content even if it appears in the context
-8. For technical questions (URLs, systems, etc.), focus only on technical documents and ignore policy/dress code documents
-9. For policy questions (dress code, procedures, etc.), focus only on policy documents
+    const systemPrompt = `You are a corporate HR/RAG assistant.
 
-Formatting Requirements:
-- Use line breaks to separate different points or sections
-- For lists, use numbered or bulleted format
-- For URLs, put each on a separate line
-- Use proper paragraph breaks for readability
-- Structure your response with clear sections when appropriate
+RULES:
+- Answer ONLY using the Provided Snippets; if insufficient, say you don't have enough info.
+- Include citation tags like [#id] for every factual claim.
+- If multiple snippets from the SAME document support a point, include multiple tags, e.g., [#2][#5].
+- Prefer consistency when snippets disagree: explain differences and cite both.
+- Return URLs ONLY if present verbatim in snippets.
+- Be concise and structured.
+- Use conversation history to understand context and references (like "one", "that", "it").
 
-Context:
-${documentText}${urlInfo}
+If the answer is under-specified, start with: "I need more context to answer precisely."
+
+FORMATTING REQUIREMENTS (CRITICAL):
+- Use bullet points (•) for each main point
+- Start each bullet with a clear statement
+- Put citations at the end of each bullet point
+- Use line breaks between different topics
+- Keep paragraphs short and focused
+- Structure information logically
+
+EXAMPLE FORMAT:
+• Employees are entitled to 20 vacation days per fiscal year [#1]
+• Vacation requests require supervisor approval [#2]
+• Leave without pay may be available as an alternative [#2]
+
+DO NOT write in paragraph form. ALWAYS use bullet points.`;
+
+    const contextBlock = snippets.map(sn => {
+      const loc = [
+        sn.filename,
+        sn.page != null ? `p.${sn.page}` : null,
+        sn.section ? `§${sn.section}` : null
+      ].filter(Boolean).join(' ');
+      return `[#${sn.id}] (${loc})\n${sn.text}`;
+    }).join('\n\n');
+
+    const providedContext = `
+Provided Snippets:
+${contextBlock}
+${urlsBlock}
+
+Recent Conversation (may provide referents only):
+${historyBlock || '(none)'}
+`;
+
+    const userPrompt = `${providedContext}
 
 Question: ${question}
 
-Answer:`;
+Answer with citations.`;
 
     const response = await axios.post('https://api.openai.com/v1/chat/completions', {
       model: 'gpt-3.5-turbo',
       messages: [
         {
           role: 'system',
-          content: 'You are a helpful HR assistant that answers questions based on company documents and policies. Provide accurate, complete answers based on the provided context. When answering policy questions, be thorough and include all relevant details. When providing URLs or specific information, be precise and match the exact terms used in the documents.'
+          content: systemPrompt
         },
         {
           role: 'user',
-          content: systemPrompt
+          content: userPrompt
         }
       ],
-      max_tokens: 800,  // Give it room for detailed answers
-      temperature: 0.3  // Keep responses focused but not robotic
+      max_tokens: 700,  // Reasonable limit for structured responses
+      temperature: 0.2  // More focused responses
     }, {
       headers: {
         'Authorization': `Bearer ${apiKey}`,
