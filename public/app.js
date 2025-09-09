@@ -133,7 +133,7 @@ async function processFileUpload(file) {
         if (result.success) {
             // Success
             uploadStatus.className = 'upload-status status-success';
-            uploadStatus.textContent = `✅ Successfully processed ${file.name} (${result.chunksProcessed} chunks created)`;
+            uploadStatus.textContent = `✅ Successfully processed ${file.name}`;
             
             // Update our counters
             docsUploaded++;
