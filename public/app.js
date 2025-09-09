@@ -141,54 +141,10 @@ async function processFileUpload(file) {
             refreshStats();
 
             // Add success message to chat
-            showChatMessage('assistant', `📄 Document "${file.name}" processed successfully! Created ${result.chunksProcessed} searchable chunks. You can now ask questions about it.`);
+            showChatMessage('assistant', `📄 Document "${file.name}" processed successfully! You can now ask questions about it.`);
         } else {
             throw new Error(result.error || 'Processing failed');
         }
-        
-        // ========================================
-        // ORIGINAL AZURE FUNCTION CODE (COMMENTED OUT)
-        // ========================================
-        /*
-        // Extract text from the file
-        const text = await extractTextFromFile(file);
-        
-        // Prepare the payload
-        const payload = {
-            text: text,
-            filename: file.name
-        };
-
-        // Update this to uploadDocuments for Vector DB usage
-        const response = await fetch(`${API_BASE_URL}/uploadDocumentsBasic`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify(payload)
-        });
-
-        const result = await response.json();
-
-        if (result.success) {
-            // Success
-            uploadStatus.className = 'upload-status status-success';
-            uploadStatus.textContent = `✅ Successfully uploaded ${file.name} (${result.chunksProcessed} chunks created)`;
-            
-            // Update our counters
-            docsUploaded++;
-            chunksCreated += result.chunksProcessed;
-            refreshStats();
-
-            // Add success message to chat
-            showChatMessage('assistant', `📄 Document "${file.name}" uploaded successfully! Created ${result.chunksProcessed} searchable chunks. You can now ask questions about it.`);
-        } else {
-            throw new Error(result.error || 'Upload failed');
-        }
-        */
-        // ========================================
-        // END ORIGINAL AZURE FUNCTION CODE
-        // ========================================
         
     } catch (error) {
         // Error

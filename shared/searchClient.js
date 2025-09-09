@@ -22,7 +22,7 @@ function getSearchClient() {
 }
 
 // Store document chunks with embeddings in search index
-async function storeInSearch(documentId, filename, chunks, embeddings) {
+async function storeInSearch(documentId, filename, chunks, embeddings, metadata = {}) {
   const client = getSearchClient();
   
   const documents = chunks.map((chunk, index) => ({
@@ -32,15 +32,17 @@ async function storeInSearch(documentId, filename, chunks, embeddings) {
     chunkIndex: index,
     content: chunk,
     chunkSize: chunk.length,
-    uploadDate: new Date().toISOString(),
+    uploadDate: metadata.uploadedAt || new Date().toISOString(),
     fileType: filename.split('.').pop().toLowerCase(),
     hasContent: chunk.length > 0,
     vector: embeddings[index] || new Array(1536).fill(0) // Include vector embeddings
+    // Note: Card metadata fields (services, urls, ips, hosts, chunkType) 
+    // would need to be added to the search index schema to be stored
   }));
 
   try {
     await client.uploadDocuments(documents);
-    console.log(`✅ Stored ${documents.length} document chunks with vector embeddings`);
+    console.log(`Stored ${documents.length} document chunks with vector embeddings`);
 
   } catch (error) {
     throw new Error(`Failed to store documents in search: ${error.message}`);
@@ -54,7 +56,7 @@ async function searchDocuments(query, topK = 5, filters = {}, queryEmbedding = n
   const searchOptions = {
     top: topK,
     select: ['id', 'documentId', 'filename', 'chunkIndex', 'content', 'chunkSize', 'uploadDate', 'fileType'],
-    searchFields: ['content^3', 'filename^2'], // Boost content 3x, filename 2x
+    searchFields: ['content', 'filename'], // Search both content and filename
     queryType: 'simple',
     searchMode: 'any'
   };

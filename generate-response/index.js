@@ -5,6 +5,36 @@ const { filterDocumentsWithLLM } = require('../shared/relevanceFilter');
 const axios = require('axios');
 require('dotenv').config();
 
+// Configuration constants
+const CONFIG = {
+  // Search parameters
+  MAX_RESULTS_HARD: 8,
+  DEFAULT_MAX_RESULTS: 5,
+  CANDIDATES: 40,
+  ENTITY_SEARCH_LIMIT: 10,
+  
+  // Document processing
+  JIRA_SCORE_PENALTY: 0.05,
+  NON_JIRA_SCORE_BOOST: 5.0,
+  TOP_RANKED_LIMIT: 20,
+  LLM_CANDIDATES_LIMIT: 15,
+  FINAL_SELECTION_LIMIT: 12,
+  
+  // Snippet building
+  DEFAULT_MAX_SNIPPETS: 8,
+  DEFAULT_PER_DOC_CAP: 3,
+  DEFAULT_MAX_CHARS_PER_SNIPPET: 1000,
+  DEFAULT_MIN_CHARS: 120,
+  
+  // Conversation management
+  MAX_CONVERSATION_HISTORY: 10,
+  
+  // API settings
+  OPENAI_MAX_TOKENS: 700,
+  OPENAI_TEMPERATURE: 0.2,
+  OPENAI_TIMEOUT: 30000
+};
+
 // Tiny stable hash to dedupe near-identical snippets
 function hash(text) {
   let h = 0; 
@@ -15,12 +45,25 @@ function hash(text) {
 }
 
 
+function pluckNeighborhood(text, rx, radius = 1) {
+  const lines = text.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    if (rx.test(lines[i])) {
+      const start = Math.max(0, i - radius);
+      const end   = Math.min(lines.length, i + radius + 1);
+      return lines.slice(start, end).join('\n').trim();
+    }
+  }
+  return null;
+}
+
 function buildSnippets(filteredDocs, {
-  maxSnippets = 8,
-  perDocCap = 2,            // avoid one doc flooding the prompt
-  maxCharsPerSnippet = 1000,
-  minChars = 120,           // skip super-tiny stuff
+  maxSnippets = CONFIG.DEFAULT_MAX_SNIPPETS,
+  perDocCap = CONFIG.DEFAULT_PER_DOC_CAP,            // avoid one doc flooding the prompt
+  maxCharsPerSnippet = CONFIG.DEFAULT_MAX_CHARS_PER_SNIPPET,
+  minChars = CONFIG.DEFAULT_MIN_CHARS,           // skip super-tiny stuff
   promoteDiversity = true,  // round-robin across docs
+  urlIntent = false,        // allow short URL/IP snippets
 } = {}) {
   // 1) Preprocess: trim, clamp, annotate, hash
   const prepared = filteredDocs.map((d, idx) => {
@@ -35,7 +78,13 @@ function buildSnippets(filteredDocs, {
       text: short,
       hash: hash(short),
     };
-  }).filter(s => s.text.length >= minChars);
+  }).filter(s => {
+    const hasUrl = /\bhttps?:\/\/[^\s)]+/i.test(s.text);
+    const hasIp  = /\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b/.test(s.text);
+    if (hasUrl || hasIp) return true;                  // always keep URL/IP snippets
+    const effMin = urlIntent ? Math.min(40, minChars)  : minChars; // looser when URL question
+    return s.text.length >= effMin;
+  });
 
   // 2) Deduplicate by hash (keep best score per hash)
   const byHash = new Map();
@@ -51,11 +100,12 @@ function buildSnippets(filteredDocs, {
     if (!buckets.has(s.filename)) buckets.set(s.filename, []);
     buckets.get(s.filename).push(s);
   }
-  // Sort each bucket by score desc (if you have scores)
+  // Sort each bucket by score desc
   for (const arr of buckets.values()) arr.sort((a, b) => (b.score - a.score));
 
-  // 4) Select with diversity: round-robin across files
+  // 4) Select with diversity: round-robin across files (simplified)
   const selections = [];
+  
   if (promoteDiversity) {
     let addedSomething = true;
     let round = 0;
@@ -80,7 +130,29 @@ function buildSnippets(filteredDocs, {
     selections.push(...flat.slice(0, maxSnippets));
   }
 
-  // 5) Assign stable snippet ids and labels
+  // 5) Last resort: micro-snippet injection only if no URL snippets found for URL queries
+  if (urlIntent && selections.length === 0) {
+    const urlRx = /\bhttps?:\/\/[^\s)]+/i;
+    const ipRx  = /\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b/;
+
+      for (const d of filteredDocs) {
+        const t = d.document.content || '';
+        const seg = pluckNeighborhood(t, urlRx) || pluckNeighborhood(t, ipRx);
+        if (seg) {
+        selections.push({
+            origIndex: -1,
+            filename: d.document.filename || 'unknown',
+            page: d.document.pageNumber ?? null,
+            section: d.document.section ?? null,
+            score: 1000, // High score to ensure it gets through
+            text: seg,
+            hash: hash(seg)
+          });
+        break; // Only add one micro-snippet as last resort
+      }
+    }
+  }
+
   return selections.map((s, i) => ({
     id: i + 1,
     filename: s.filename,
@@ -93,128 +165,365 @@ function buildSnippets(filteredDocs, {
 // Simple in-memory conversation storage (in production, use Redis or database)
 const conversationMemory = new Map();
 
+// Parse and validate request
+function parseRequest(request) {
+  // Handle CORS preflight requests
+  if (request.method === 'OPTIONS') {
+    return {
+      isCors: true,
+      response: {
+        status: 200,
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With',
+          'Access-Control-Max-Age': '86400'
+        },
+        body: ''
+      }
+    };
+  }
+
+  // Input validation and capping
+  const parseTop = (v) => {
+    const n = Number(v);
+    return Number.isInteger(n) && n >= 1 && n <= CONFIG.MAX_RESULTS_HARD ? n : CONFIG.DEFAULT_MAX_RESULTS;
+  };
+
+  let userQuestion, maxResults, requestBody = {};
+  
+  if (request.method === 'GET') {
+    // Get question from URL params
+    userQuestion = request.query.get('question')?.trim();
+    maxResults = parseTop(request.query.get('top'));
+  } else {
+    // Get question from request body
+    requestBody = request.json().catch(() => ({}));
+    userQuestion = requestBody?.question?.trim();
+    maxResults = parseTop(requestBody?.top);
+  }
+
+  if (!userQuestion) {
+    return {
+      error: {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' },
+        jsonBody: {
+          success: false,
+          error: 'Question parameter is required'
+        }
+      }
+    };
+  }
+
+  // Get session ID for conversation memory [ change on producti]
+  const sessionId = requestBody?.sessionId || request.query.get('sessionId') || 'default';
+
+  return {
+    userQuestion,
+    maxResults,
+    sessionId,
+    requestBody
+  };
+}
+
+// Get conversation history
+function getConversationHistory(sessionId) {
+  if (!conversationMemory.has(sessionId)) {
+    conversationMemory.set(sessionId, []);
+  }
+  return conversationMemory.get(sessionId);
+}
+
+// Save conversation to memory
+function saveConversation(sessionId, userQuestion, aiAnswer) {
+  const conversationHistory = getConversationHistory(sessionId);
+  
+  conversationHistory.push({
+    role: 'user',
+    content: userQuestion,
+    timestamp: new Date().toISOString()
+  });
+  conversationHistory.push({
+    role: 'assistant', 
+    content: aiAnswer,
+    timestamp: new Date().toISOString()
+  });
+
+  // Keep only last N messages to prevent memory bloat
+  if (conversationHistory.length > CONFIG.MAX_CONVERSATION_HISTORY) {
+    conversationHistory.splice(0, conversationHistory.length - CONFIG.MAX_CONVERSATION_HISTORY);
+  }
+}
+
+// Fetch candidate documents from all search sources
+async function fetchCandidates(userQuestion, context) {
+  context.log('Starting parallel searches...');
+  
+  // Stable deduplication key function (defensive against missing document properties)
+  const docKey = (d) => {
+    const doc = d?.document || {};
+    return doc.id || `${doc.filename || 'unknown'}|${String(doc.content || '').slice(0,100)}`;
+  };
+  
+  // Generic deduplication helper
+  const unique = (arr) => {
+    const seen = new Set();
+    return arr.filter(d => (seen.has(docKey(d)) ? false : (seen.add(docKey(d)), true)));
+  };
+
+  try {
+    // Create embeddings with error handling
+    const queryEmbedding = await createEmbeddings([userQuestion]);
+    
+    const mainSearchPromise = hybridSearch(userQuestion, queryEmbedding[0], CONFIG.CANDIDATES)
+      .catch(err => {
+        context.log('Hybrid search failed, falling back to text search:', err.message);
+        return searchDocuments(userQuestion, CONFIG.CANDIDATES);
+      });
+
+    const searchPromises = [mainSearchPromise];
+
+    // Entity search for capitalized terms and parenthetical phrases
+    const entityTerms = (() => {
+      const m = userQuestion.match(/[A-Z][A-Za-z0-9()_-]{2,}/g) || [];
+      // add parenthetical phrases like "(Platform)"
+      const paren = userQuestion.match(/\([^)]+\)/g) || [];
+      const addNor = /(^|\b)nor(\b|[^a-z])/i.test(userQuestion);
+      const uniq = [...new Set([...m, ...paren, ...(addNor ? ['NOR'] : [])])];
+      return uniq.filter(s => s.length <= 40);
+    })();
+    
+    if (entityTerms.length) {
+      const q = entityTerms.map(s => `"${s}"`).join(' OR ');
+      searchPromises.push(
+        searchDocuments(q, CONFIG.ENTITY_SEARCH_LIMIT).catch(err => {
+          context.log('Entity search failed:', err.message);
+          return []; // Return empty on failure
+        })
+      );
+    }
+
+    // Await all searches to complete in parallel
+    const allSearchResults = await Promise.all(searchPromises);
+    
+    // Flatten and deduplicate results
+    const allDocs = allSearchResults.flat();
+    let relevantDocs = unique(allDocs);
+    
+    context.log(`Found ${relevantDocs.length} initial documents from parallel searches`);
+    
+    // Deduplicate the merged results
+    relevantDocs = unique(relevantDocs);
+    context.log(`Found ${relevantDocs.length} initial documents after deduplication`);
+    
+    return relevantDocs;
+    
+  } catch (error) {
+    context.log('Error in fetchCandidates:', error.message);
+    throw error;
+  }
+}
+
+// Rank and filter documents
+function rankAndFilterDocuments(relevantDocs, userQuestion, context) {
+  // Hoisted regexes to avoid duplication
+  const urlRx = /\bhttps?:\/\/[^\s)]+/i;
+  const ipRx  = /\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b/;
+  
+  // Tokenization and stopword filtering
+  const tokens = (str) => String(str).toLowerCase().match(/[a-z0-9()_-]+/g) || [];
+  const stop = new Set(['what','is','the','for','a','an','of','to','in','on','and','or','url','link','endpoint','ip','host','address']);
+  
+  // Stable deduplication key function
+  const docKey = (d) => {
+    const doc = d?.document || {};
+    return doc.id || `${doc.filename || 'unknown'}|${String(doc.content || '').slice(0,100)}`;
+  };
+  
+  // Generic deduplication helper
+  const unique = (arr) => {
+    const seen = new Set();
+    return arr.filter(d => (seen.has(docKey(d)) ? false : (seen.add(docKey(d)), true)));
+  };
+
+  // Pre-process documents once to compute all properties
+  const urlIntent = /\b(url|link|endpoint|ip|host|address)\b/i.test(userQuestion);
+  const isUrlQuery = /\b(url|link|endpoint|ip|host|address|platform)\b/i.test(userQuestion);
+  const qTokens = tokens(userQuestion).filter(w => !stop.has(w));
+  
+  // Helper functions for document analysis
+  const getContentQualityScore = (content) => {
+    const wordCount = content.split(/\s+/).length;
+    const linkCount = (content.match(/https?:\/\//g) || []).length;
+    const downloadCount = (content.match(/download|attachment|browse/g) || []).length;
+    const hasPolicyContent = /^\d+\.\s|entitled to \d+|must be requested|effective date|last updated/i.test(content);
+    
+    // Higher score for more content, lower score for more references
+    const contentRatio = wordCount / Math.max(1, linkCount + downloadCount);
+    const policyBoost = hasPolicyContent ? 2.0 : 1.0;
+    
+    return contentRatio * policyBoost;
+  };
+  
+  const getFileTypePriority = (filename) => {
+    if (filename.includes('.pdf')) return 2.0;
+    if (filename.includes('.docx') || filename.includes('.doc')) return 1.8;
+    if (filename.includes('confluence')) return 0.7;  // Lower priority for Confluence
+    return 1.0;  // Default
+  };
+  
+  const determineIfJira = (filename, content) => {
+    // Strict Jira-only detector (not broad paragontesting detection)
+    const jiraDomainRx = /https?:\/\/[^\/]*atlassian\.net\//i;           // only Jira host
+    const jiraBrowseRx = /(?:^|\/)browse\/[A-Z][A-Z0-9]+-\d+\b/i;        // .../browse/TEC-123
+    const jiraKeyRx    = /\b[A-Z][A-Z0-9]+-\d+\b/;                       // TEC-123 style keys
+
+    const inJira = (s) => jiraDomainRx.test(s) || jiraBrowseRx.test(s) || /\bjira\b/i.test(s);
+
+    return inJira(filename) || inJira(content) ||
+           (jiraKeyRx.test(content) && jiraDomainRx.test(content)); // key + Jira host
+  };
+  
+  // Single pass through documents to compute all properties
+  const processedDocs = relevantDocs.map(d => {
+    const content = d.document.content || '';
+    const filename = d.document.filename || '';
+    
+    // Perform all regex tests once
+    const hasUrl = urlRx.test(content);
+    const hasIp = ipRx.test(content);
+    const isJiraFile = determineIfJira(filename, content);
+    
+    // Check for exact matches (must keep)
+    const text = content.toLowerCase();
+    const file = filename.toLowerCase();
+    const hasExactMatch = qTokens.some(w => text.includes(w) || file.includes(w)) ||
+                         text.includes('nor (platform)') || text.includes('nor celpip') ||
+                         text.includes('cael-registration.cael.ca');
+    
+    // Check for card chunks (short lines with URLs/IPs)
+    const lines = content.split('\n').map(s => s.trim()).filter(Boolean);
+    const isCardChunk = isUrlQuery && lines.length <= 8 && (hasUrl || hasIp);
+    
+    // Calculate adjusted score
+    let adjustedScore = d.score || 0;
+    if (isJiraFile) {
+      adjustedScore *= CONFIG.JIRA_SCORE_PENALTY; // 5% of original score
+    } else {
+      adjustedScore *= CONFIG.NON_JIRA_SCORE_BOOST; // 500% of original score
+    }
+    
+    // Apply content quality and file type adjustments
+    const contentQuality = getContentQualityScore(content);
+    const fileTypePriority = getFileTypePriority(filename);
+    adjustedScore *= contentQuality * fileTypePriority;
+
+    return {
+      ...d, // original document and score
+      hasUrl,
+      hasIp,
+      isJiraFile,
+      hasExactMatch,
+      isCardChunk,
+      adjustedScore
+    };
+  });
+
+  // Now sort once by the new score
+  processedDocs.sort((a, b) => b.adjustedScore - a.adjustedScore);
+  
+  // Extract must-keep documents
+  const mustKeepUrlDocs = urlIntent 
+    ? processedDocs.filter(d => d.hasUrl || d.hasIp)
+    : [];
+  const mustKeep = processedDocs.filter(d => d.hasExactMatch);
+  const cardDocs = processedDocs.filter(d => d.isCardChunk);
+  
+  // Add card docs to mustKeep if not already there
+  for (const cardDoc of cardDocs) {
+    const exists = mustKeep.some(d => docKey(d) === docKey(cardDoc));
+    if (!exists) {
+      mustKeep.push(cardDoc);
+    }
+  }
+  
+  if (urlIntent) {
+    context.log(`URL intent detected, prioritized ${mustKeepUrlDocs.length} URL/IP documents`);
+  }
+  context.log(`Found ${mustKeep.length} exact matches that must be kept`);
+  context.log(`Found ${cardDocs.length} card chunks for URL/IP query`);
+  context.log(`Applied priority adjustments: TEC content (paragontesting URLs) deprioritized, non-TEC content boosted`);
+
+  // Streamlined Funnel: Score & Rank → Preserve → Filter/Select
+  
+  // Step 1: Score & Rank (already done - processedDocs is sorted by adjustedScore)
+  context.log(`Documents ranked by adjusted scores, top score: ${processedDocs[0]?.adjustedScore || 0}`);
+  
+  // Step 2: Preserve - Identify must-keep documents from the top of ranked list
+  const topRankedDocs = processedDocs.slice(0, Math.min(CONFIG.TOP_RANKED_LIMIT, processedDocs.length));
+  const preservedMustKeep = mustKeep.filter(doc => 
+    topRankedDocs.some(topDoc => docKey(doc) === docKey(topDoc))
+  );
+  const preservedMustKeepUrlDocs = mustKeepUrlDocs.filter(doc => 
+    topRankedDocs.some(topDoc => docKey(doc) === docKey(topDoc))
+  );
+  
+  context.log(`Preserved ${preservedMustKeep.length} must-keep docs and ${preservedMustKeepUrlDocs.length} URL docs from top-ranked results`);
+  
+  // Step 3: Filter/Select - Take top N results (simplified approach)
+  const finalDocs = processedDocs.slice(0, Math.min(CONFIG.FINAL_SELECTION_LIMIT, processedDocs.length));
+  
+  // Step 4: Final selection - Combine preserved docs with filtered results
+  const finalSelection = unique([...preservedMustKeepUrlDocs, ...preservedMustKeep, ...finalDocs]);
+  
+  context.log(`Final selection: ${finalSelection.length} documents`);
+  
+  return finalSelection;
+}
+
 app.http('generateResponse', {
   methods: ['GET', 'POST', 'OPTIONS'],
   authLevel: 'anonymous',
   handler: async (request, context) => {
     try {
-      // Handle CORS preflight requests
-      if (request.method === 'OPTIONS') {
-        return {
-          status: 200,
-          headers: {
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-            'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With',
-            'Access-Control-Max-Age': '86400'
-          },
-          body: ''
-        };
-      }
-
       context.log('Starting to process question');
       
-      // Input validation and capping
-      const MAX_RESULTS_HARD = 8;
-      const parseTop = (v) => {
-        const n = Number(v);
-        return Number.isInteger(n) && n >= 1 && n <= MAX_RESULTS_HARD ? n : 5;
-      };
-
-      let userQuestion, maxResults = 5, requestBody = {};
-
-      if (request.method === 'GET') {
-        // Get question from URL params
-        userQuestion = request.query.get('question')?.trim();
-        maxResults = parseTop(request.query.get('top'));
-      } else {
-        // Get question from request body
-        requestBody = await request.json().catch(() => ({}));
-        userQuestion = requestBody?.question?.trim();
-        maxResults = parseTop(requestBody?.top);
+      // Step 1: Parse and validate request
+      const parseResult = await parseRequest(request);
+      if (parseResult.isCors) {
+        return parseResult.response;
       }
-
-      if (!userQuestion) {
-        return {
-          status: 400,
-          headers: { 'Content-Type': 'application/json' },
-          jsonBody: {
-            success: false,
-            error: 'Question parameter is required'
-          }
-        };
+      if (parseResult.error) {
+        return parseResult.error;
       }
-
-      // Get session ID for conversation memory
-      const sessionId = requestBody?.sessionId || request.query.get('sessionId') || 'default';
       
-      // Get conversation history for this session
-      if (!conversationMemory.has(sessionId)) {
-        conversationMemory.set(sessionId, []);
-      }
-      const conversationHistory = conversationMemory.get(sessionId);
-
-      // Check if this is a follow-up question about vacation (common pattern)
-      const isVacationFollowUp = conversationHistory.length > 0 && 
-        conversationHistory.some(msg => msg.content.toLowerCase().includes('vacation')) &&
-        (userQuestion.toLowerCase().includes('how do i request') || 
-         userQuestion.toLowerCase().includes('how can i request') ||
-         userQuestion.toLowerCase().includes('request one') ||
-         userQuestion.toLowerCase().includes('how to request'));
-      
-      if (isVacationFollowUp) {
-        // Force search for vacation request procedures
-        userQuestion = 'vacation request procedure how to request vacation time';
-        context.log(`Detected vacation follow-up question, searching for: "${userQuestion}"`);
-      }
-
+      const { userQuestion, maxResults, sessionId } = parseResult;
       context.log(`Looking for info about: "${userQuestion}"`);
 
-      // Find documents that might have the answer using hybrid search
-      let relevantDocs = [];
-      try {
-        // Try hybrid search first (text + vector)
-        const queryEmbedding = await createEmbeddings([userQuestion]);
-        relevantDocs = await hybridSearch(userQuestion, queryEmbedding[0], maxResults);
-      } catch (error) {
-        context.log('Hybrid search failed, trying text search:', error.message);
-        try {
-          // Fallback to text search if vector search fails
-          relevantDocs = await searchDocuments(userQuestion, maxResults);
-        } catch (e2) {
-          context.error('All search strategies failed', e2);
-          relevantDocs = [];
-        }
-      }
-      
-      // Ensure relevantDocs is always an array
-      relevantDocs = Array.isArray(relevantDocs) ? relevantDocs : [];
-      
-      context.log(`Found ${relevantDocs.length} initial documents`);
-      
-      // Positive pre-filter: never drop exact matches
-      const q = userQuestion.toLowerCase();
-      const mustKeep = relevantDocs.filter(d => {
-        const t = (d.document.content || '').toLowerCase();
-        const f = (d.document.filename || '').toLowerCase();
-        return t.includes(q) || f.includes(q) || 
-               q.includes('nor') && (t.includes('nor') || f.includes('nor'));
-      });
-      context.log(`Found ${mustKeep.length} exact matches that must be kept`);
+      // Step 2: Fetch conversation state
+      const conversationHistory = getConversationHistory(sessionId);
 
-      // Use smart LLM filtering to keep only relevant documents
-      let filteredDocs = await filterDocumentsWithLLM(userQuestion, relevantDocs);
-      context.log(`After LLM filtering: ${filteredDocs.length} relevant documents`);
+      // Step 3: Retrieve candidates
+      const relevantDocs = await fetchCandidates(userQuestion, context);
       
-      // Merge exact matches with LLM filtered results (dedupe by document ID)
-      const allDocs = [...filteredDocs];
-      for (const exactDoc of mustKeep) {
-        const exists = allDocs.some(d => d.document.id === exactDoc.document.id);
-        if (!exists) {
-          allDocs.push(exactDoc);
-        }
-      }
-      filteredDocs = allDocs;
+      // Basic sanity logs
+      const preview = relevantDocs.slice(0, 12).map(d => ({
+        file: d.document.filename,
+        hasNOR: /(^|\b)nor(\b|[^a-z])/i.test(d.document.content || ''),
+        hasURL: /https?:\/\//i.test(d.document.content || '')
+      }));
+      context.log('retrievalPreview', JSON.stringify(preview, null, 2));
+      
+      const stats = {
+        total: relevantDocs.length,
+        anyNOR: relevantDocs.some(d => /(^|\b)nor(\b|[^a-z])/i.test(d.document.content || '')),
+        anyURL: relevantDocs.some(d => /https?:\/\//i.test(d.document.content || ''))
+      };
+      context.log('retrievalStats', stats);
+
+      // Step 4: Rank and filter documents
+      const filteredDocs = rankAndFilterDocuments(relevantDocs, userQuestion, context);
       
       if (filteredDocs.length === 0) {
         return {
@@ -235,34 +544,22 @@ app.http('generateResponse', {
         };
       }
 
-      // Build enhanced snippets with deduplication and diversity
+      // Step 5: Generate snippets
+      const urlIntent = /\b(url|link|endpoint|ip|host|address)\b/i.test(userQuestion);
       const snippets = buildSnippets(filteredDocs, {
-        maxSnippets: Math.min(8, maxResults),
-        perDocCap: 3, // Allow more from same doc if corpus is small
-        maxCharsPerSnippet: 1000,
-        minChars: 120,
-        promoteDiversity: true
+        maxSnippets: Math.min(CONFIG.DEFAULT_MAX_SNIPPETS, maxResults),
+        perDocCap: CONFIG.DEFAULT_PER_DOC_CAP,
+        maxCharsPerSnippet: CONFIG.DEFAULT_MAX_CHARS_PER_SNIPPET,
+        minChars: CONFIG.DEFAULT_MIN_CHARS,
+        promoteDiversity: true,
+        urlIntent
       });
 
-      // Ask OpenAI to answer based on structured snippets
+      // Step 6: Generate final answer
       const aiAnswer = await getAnswerFromOpenAI(userQuestion, snippets, conversationHistory);
 
-      // Store conversation in memory
-      conversationHistory.push({
-        role: 'user',
-        content: userQuestion,
-        timestamp: new Date().toISOString()
-      });
-      conversationHistory.push({
-        role: 'assistant', 
-        content: aiAnswer,
-        timestamp: new Date().toISOString()
-      });
-
-      // Keep only last 10 messages to prevent memory bloat
-      if (conversationHistory.length > 10) {
-        conversationHistory.splice(0, conversationHistory.length - 10);
-      }
+      // Step 7: Update state and respond
+      saveConversation(sessionId, userQuestion, aiAnswer);
 
       // Check if AI is asking for clarification or can't provide specific answer
       const isNonSpecificAnswer = aiAnswer.toLowerCase().includes('more specific') || 
@@ -433,14 +730,14 @@ Answer with citations.`;
           content: userPrompt
         }
       ],
-      max_tokens: 700,  // Reasonable limit for structured responses
-      temperature: 0.2  // More focused responses
+      max_tokens: CONFIG.OPENAI_MAX_TOKENS,  // Reasonable limit for structured responses
+      temperature: CONFIG.OPENAI_TEMPERATURE  // More focused responses
     }, {
       headers: {
         'Authorization': `Bearer ${apiKey}`,
         'Content-Type': 'application/json'
       },
-      timeout: 30000 // 30 second timeout to prevent socket hang up
+      timeout: CONFIG.OPENAI_TIMEOUT // 30 second timeout to prevent socket hang up
     });
 
     return response.data.choices[0].message.content;
