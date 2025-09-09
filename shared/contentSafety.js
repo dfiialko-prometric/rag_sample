@@ -19,7 +19,7 @@ async function checkWithContentSafety(text) {
         const response = await client.path("/text:analyze").post({
             body: {
                 text: text,
-                categories: ["Credentials", "Confidential"],
+                categories: ["Hate", "Sexual", "SelfHarm", "Violence"],
             },
         });
         
