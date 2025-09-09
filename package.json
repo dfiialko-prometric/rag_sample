@@ -22,6 +22,8 @@
   "license": "MIT",
   "main": "./index.js",
   "dependencies": {
+    "@azure-rest/ai-content-safety": "^1.0.1",
+    "@azure/core-auth": "^1.10.0",
     "@azure/functions": "^4.0.0",
     "@azure/openai": "^1.0.0-beta.8",
     "@azure/search-documents": "^12.0.0",
