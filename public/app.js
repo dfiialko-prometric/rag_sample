@@ -5,6 +5,49 @@ const API_BASE_URL = 'https://prochat-function-app-d2gnekb9cadvfmes.canadacentra
 let docsUploaded = 0;
 let questionsAsked = 0;
 let chunksCreated = 0;
+let sessionId = generateSessionId();
+
+// Generate a unique session ID for conversation memory
+function generateSessionId() {
+    return 'session_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+}
+
+// Convert URLs to clickable short text
+function formatUrlsAsClickable(text) {
+    // URL regex pattern - more comprehensive
+    const urlRegex = /(https?:\/\/[^\s<>"{}|\\^`\[\]]+)/gi;
+    
+    return text.replace(urlRegex, function(url) {
+        // Create short display text
+        let displayText = url;
+        
+        // Remove protocol
+        displayText = displayText.replace(/^https?:\/\//, '');
+        
+        // Remove www. prefix
+        displayText = displayText.replace(/^www\./, '');
+        
+        // Handle common patterns for better display
+        if (displayText.includes('/')) {
+            const parts = displayText.split('/');
+            if (parts.length > 1) {
+                // Show domain + first path segment
+                displayText = parts[0] + '/' + parts[1];
+                if (parts.length > 2) {
+                    displayText += '/...';
+                }
+            }
+        }
+        
+        // Truncate if still too long
+        if (displayText.length > 35) {
+            displayText = displayText.substring(0, 32) + '...';
+        }
+        
+        // Create clickable link
+        return `<a href="${url}" target="_blank" rel="noopener noreferrer">${displayText}</a>`;
+    });
+}
 
 // Get everything set up when page loads
 document.addEventListener('DOMContentLoaded', function() {
@@ -98,54 +141,10 @@ async function processFileUpload(file) {
             refreshStats();
 
             // Add success message to chat
-            showChatMessage('assistant', `📄 Document "${file.name}" processed successfully! Created ${result.chunksProcessed} searchable chunks. You can now ask questions about it.`);
+            showChatMessage('assistant', `📄 Document "${file.name}" processed successfully! You can now ask questions about it.`);
         } else {
             throw new Error(result.error || 'Processing failed');
         }
-        
-        // ========================================
-        // ORIGINAL AZURE FUNCTION CODE (COMMENTED OUT)
-        // ========================================
-        /*
-        // Extract text from the file
-        const text = await extractTextFromFile(file);
-        
-        // Prepare the payload
-        const payload = {
-            text: text,
-            filename: file.name
-        };
-
-        // Update this to uploadDocuments for Vector DB usage
-        const response = await fetch(`${API_BASE_URL}/uploadDocumentsBasic`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify(payload)
-        });
-
-        const result = await response.json();
-
-        if (result.success) {
-            // Success
-            uploadStatus.className = 'upload-status status-success';
-            uploadStatus.textContent = `✅ Successfully uploaded ${file.name} (${result.chunksProcessed} chunks created)`;
-            
-            // Update our counters
-            docsUploaded++;
-            chunksCreated += result.chunksProcessed;
-            refreshStats();
-
-            // Add success message to chat
-            showChatMessage('assistant', `📄 Document "${file.name}" uploaded successfully! Created ${result.chunksProcessed} searchable chunks. You can now ask questions about it.`);
-        } else {
-            throw new Error(result.error || 'Upload failed');
-        }
-        */
-        // ========================================
-        // END ORIGINAL AZURE FUNCTION CODE
-        // ========================================
         
     } catch (error) {
         // Error
@@ -210,9 +209,9 @@ async function submitQuestion() {
     loadingIndicator.style.display = 'block';
 
     try {
-        // Call the generate response API through local proxy
-        console.log('Making request to:', `/ask?question=${encodeURIComponent(question)}`);
-        const response = await fetch(`/ask?question=${encodeURIComponent(question)}`);
+        // Call the generate response API through local proxy with session ID
+        console.log('Making request to:', `/ask?question=${encodeURIComponent(question)}&sessionId=${sessionId}`);
+        const response = await fetch(`/ask?question=${encodeURIComponent(question)}&sessionId=${sessionId}`);
         console.log('Response status:', response.status);
         const result = await response.json();
 
@@ -251,8 +250,9 @@ function showChatMessage(sender, content) {
     
     const contentDiv = document.createElement('div');
     contentDiv.className = 'message-content';
-    // Convert newlines to <br> tags for proper formatting
-    contentDiv.innerHTML = content.replace(/\n/g, '<br>');
+    // Convert newlines to <br> tags and format URLs as clickable links
+    const formattedContent = formatUrlsAsClickable(content.replace(/\n/g, '<br>'));
+    contentDiv.innerHTML = formattedContent;
     
     bubbleDiv.appendChild(contentDiv);
     messageDiv.appendChild(bubbleDiv);

@@ -5,78 +5,525 @@ const { filterDocumentsWithLLM } = require('../shared/relevanceFilter');
 const axios = require('axios');
 require('dotenv').config();
 
+// Configuration constants
+const CONFIG = {
+  // Search parameters
+  MAX_RESULTS_HARD: 8,
+  DEFAULT_MAX_RESULTS: 5,
+  CANDIDATES: 40,
+  ENTITY_SEARCH_LIMIT: 10,
+  
+  // Document processing
+  JIRA_SCORE_PENALTY: 0.05,
+  NON_JIRA_SCORE_BOOST: 5.0,
+  TOP_RANKED_LIMIT: 20,
+  LLM_CANDIDATES_LIMIT: 15,
+  FINAL_SELECTION_LIMIT: 12,
+  
+  // Snippet building
+  DEFAULT_MAX_SNIPPETS: 8,
+  DEFAULT_PER_DOC_CAP: 3,
+  DEFAULT_MAX_CHARS_PER_SNIPPET: 1000,
+  DEFAULT_MIN_CHARS: 120,
+  
+  // Conversation management
+  MAX_CONVERSATION_HISTORY: 10,
+  
+  // API settings
+  OPENAI_MAX_TOKENS: 700,
+  OPENAI_TEMPERATURE: 0.2,
+  OPENAI_TIMEOUT: 30000
+};
+
+// Tiny stable hash to dedupe near-identical snippets
+function hash(text) {
+  let h = 0; 
+  for (let i = 0; i < text.length; i++) { 
+    h = (h * 31 + text.charCodeAt(i)) | 0; 
+  }
+  return h >>> 0;
+}
+
+
+function pluckNeighborhood(text, rx, radius = 1) {
+  const lines = text.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    if (rx.test(lines[i])) {
+      const start = Math.max(0, i - radius);
+      const end   = Math.min(lines.length, i + radius + 1);
+      return lines.slice(start, end).join('\n').trim();
+    }
+  }
+  return null;
+}
+
+function buildSnippets(filteredDocs, {
+  maxSnippets = CONFIG.DEFAULT_MAX_SNIPPETS,
+  perDocCap = CONFIG.DEFAULT_PER_DOC_CAP,            // avoid one doc flooding the prompt
+  maxCharsPerSnippet = CONFIG.DEFAULT_MAX_CHARS_PER_SNIPPET,
+  minChars = CONFIG.DEFAULT_MIN_CHARS,           // skip super-tiny stuff
+  promoteDiversity = true,  // round-robin across docs
+  urlIntent = false,        // allow short URL/IP snippets
+} = {}) {
+  // 1) Preprocess: trim, clamp, annotate, hash
+  const prepared = filteredDocs.map((d, idx) => {
+    const text = String(d.document.content || '').trim();
+    const short = text.slice(0, maxCharsPerSnippet);
+    return {
+      origIndex: idx,
+      filename: d.document.filename || 'unknown',
+      page: d.document.pageNumber ?? null,
+      section: d.document.section ?? null,
+      score: d.score ?? 0,
+      text: short,
+      hash: hash(short),
+    };
+  }).filter(s => {
+    const hasUrl = /\bhttps?:\/\/[^\s)]+/i.test(s.text);
+    const hasIp  = /\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b/.test(s.text);
+    if (hasUrl || hasIp) return true;                  // always keep URL/IP snippets
+    const effMin = urlIntent ? Math.min(40, minChars)  : minChars; // looser when URL question
+    return s.text.length >= effMin;
+  });
+
+  // 2) Deduplicate by hash (keep best score per hash)
+  const byHash = new Map();
+  for (const s of prepared) {
+    const existing = byHash.get(s.hash);
+    if (!existing || s.score > existing.score) byHash.set(s.hash, s);
+  }
+  const deduped = Array.from(byHash.values());
+
+  // 3) Group by filename to enforce per-doc cap
+  const buckets = new Map();
+  for (const s of deduped) {
+    if (!buckets.has(s.filename)) buckets.set(s.filename, []);
+    buckets.get(s.filename).push(s);
+  }
+  // Sort each bucket by score desc
+  for (const arr of buckets.values()) arr.sort((a, b) => (b.score - a.score));
+
+  // 4) Select with diversity: round-robin across files (simplified)
+  const selections = [];
+  
+  if (promoteDiversity) {
+    let addedSomething = true;
+    let round = 0;
+    while (selections.length < maxSnippets && addedSomething) {
+      addedSomething = false;
+      for (const [filename, arr] of buckets) {
+        const taken = selections.filter(x => x.filename === filename).length;
+        if (taken >= perDocCap) continue;
+        if (round < arr.length) {
+          selections.push(arr[round]);
+          addedSomething = true;
+          if (selections.length >= maxSnippets) break;
+        }
+      }
+      round++;
+    }
+  } else {
+    // Simple global top-k after perDocCap
+    const flat = [];
+    for (const arr of buckets.values()) flat.push(...arr.slice(0, perDocCap));
+    flat.sort((a, b) => (b.score - a.score));
+    selections.push(...flat.slice(0, maxSnippets));
+  }
+
+  // 5) Last resort: micro-snippet injection only if no URL snippets found for URL queries
+  if (urlIntent && selections.length === 0) {
+    const urlRx = /\bhttps?:\/\/[^\s)]+/i;
+    const ipRx  = /\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b/;
+
+      for (const d of filteredDocs) {
+        const t = d.document.content || '';
+        const seg = pluckNeighborhood(t, urlRx) || pluckNeighborhood(t, ipRx);
+        if (seg) {
+        selections.push({
+            origIndex: -1,
+            filename: d.document.filename || 'unknown',
+            page: d.document.pageNumber ?? null,
+            section: d.document.section ?? null,
+            score: 1000, // High score to ensure it gets through
+            text: seg,
+            hash: hash(seg)
+          });
+        break; // Only add one micro-snippet as last resort
+      }
+    }
+  }
+
+  return selections.map((s, i) => ({
+    id: i + 1,
+    filename: s.filename,
+    page: s.page,
+    section: s.section,
+    text: s.text
+  }));
+}
+
+// Simple in-memory conversation storage (in production, use Redis or database)
+const conversationMemory = new Map();
+
+// Parse and validate request
+function parseRequest(request) {
+  // Handle CORS preflight requests
+  if (request.method === 'OPTIONS') {
+    return {
+      isCors: true,
+      response: {
+        status: 200,
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With',
+          'Access-Control-Max-Age': '86400'
+        },
+        body: ''
+      }
+    };
+  }
+
+  // Input validation and capping
+  const parseTop = (v) => {
+    const n = Number(v);
+    return Number.isInteger(n) && n >= 1 && n <= CONFIG.MAX_RESULTS_HARD ? n : CONFIG.DEFAULT_MAX_RESULTS;
+  };
+
+  let userQuestion, maxResults, requestBody = {};
+  
+  if (request.method === 'GET') {
+    // Get question from URL params
+    userQuestion = request.query.get('question')?.trim();
+    maxResults = parseTop(request.query.get('top'));
+  } else {
+    // Get question from request body
+    requestBody = request.json().catch(() => ({}));
+    userQuestion = requestBody?.question?.trim();
+    maxResults = parseTop(requestBody?.top);
+  }
+
+  if (!userQuestion) {
+    return {
+      error: {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' },
+        jsonBody: {
+          success: false,
+          error: 'Question parameter is required'
+        }
+      }
+    };
+  }
+
+  // Get session ID for conversation memory [ change on producti]
+  const sessionId = requestBody?.sessionId || request.query.get('sessionId') || 'default';
+
+  return {
+    userQuestion,
+    maxResults,
+    sessionId,
+    requestBody
+  };
+}
+
+// Get conversation history
+function getConversationHistory(sessionId) {
+  if (!conversationMemory.has(sessionId)) {
+    conversationMemory.set(sessionId, []);
+  }
+  return conversationMemory.get(sessionId);
+}
+
+// Save conversation to memory
+function saveConversation(sessionId, userQuestion, aiAnswer) {
+  const conversationHistory = getConversationHistory(sessionId);
+  
+  conversationHistory.push({
+    role: 'user',
+    content: userQuestion,
+    timestamp: new Date().toISOString()
+  });
+  conversationHistory.push({
+    role: 'assistant', 
+    content: aiAnswer,
+    timestamp: new Date().toISOString()
+  });
+
+  // Keep only last N messages to prevent memory bloat
+  if (conversationHistory.length > CONFIG.MAX_CONVERSATION_HISTORY) {
+    conversationHistory.splice(0, conversationHistory.length - CONFIG.MAX_CONVERSATION_HISTORY);
+  }
+}
+
+// Fetch candidate documents from all search sources
+async function fetchCandidates(userQuestion, context) {
+  context.log('Starting parallel searches...');
+  
+  // Stable deduplication key function (defensive against missing document properties)
+  const docKey = (d) => {
+    const doc = d?.document || {};
+    return doc.id || `${doc.filename || 'unknown'}|${String(doc.content || '').slice(0,100)}`;
+  };
+  
+  // Generic deduplication helper
+  const unique = (arr) => {
+    const seen = new Set();
+    return arr.filter(d => (seen.has(docKey(d)) ? false : (seen.add(docKey(d)), true)));
+  };
+
+  try {
+    // Create embeddings with error handling
+    const queryEmbedding = await createEmbeddings([userQuestion]);
+    
+    const mainSearchPromise = hybridSearch(userQuestion, queryEmbedding[0], CONFIG.CANDIDATES)
+      .catch(err => {
+        context.log('Hybrid search failed, falling back to text search:', err.message);
+        return searchDocuments(userQuestion, CONFIG.CANDIDATES);
+      });
+
+    const searchPromises = [mainSearchPromise];
+
+    // Entity search for capitalized terms and parenthetical phrases
+    const entityTerms = (() => {
+      const m = userQuestion.match(/[A-Z][A-Za-z0-9()_-]{2,}/g) || [];
+      // add parenthetical phrases like "(Platform)"
+      const paren = userQuestion.match(/\([^)]+\)/g) || [];
+      const addNor = /(^|\b)nor(\b|[^a-z])/i.test(userQuestion);
+      const uniq = [...new Set([...m, ...paren, ...(addNor ? ['NOR'] : [])])];
+      return uniq.filter(s => s.length <= 40);
+    })();
+    
+    if (entityTerms.length) {
+      const q = entityTerms.map(s => `"${s}"`).join(' OR ');
+      searchPromises.push(
+        searchDocuments(q, CONFIG.ENTITY_SEARCH_LIMIT).catch(err => {
+          context.log('Entity search failed:', err.message);
+          return []; // Return empty on failure
+        })
+      );
+    }
+
+    // Await all searches to complete in parallel
+    const allSearchResults = await Promise.all(searchPromises);
+    
+    // Flatten and deduplicate results
+    const allDocs = allSearchResults.flat();
+    let relevantDocs = unique(allDocs);
+    
+    context.log(`Found ${relevantDocs.length} initial documents from parallel searches`);
+    
+    // Deduplicate the merged results
+    relevantDocs = unique(relevantDocs);
+    context.log(`Found ${relevantDocs.length} initial documents after deduplication`);
+    
+    return relevantDocs;
+    
+  } catch (error) {
+    context.log('Error in fetchCandidates:', error.message);
+    throw error;
+  }
+}
+
+// Rank and filter documents
+function rankAndFilterDocuments(relevantDocs, userQuestion, context) {
+  // Hoisted regexes to avoid duplication
+  const urlRx = /\bhttps?:\/\/[^\s)]+/i;
+  const ipRx  = /\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b/;
+  
+  // Tokenization and stopword filtering
+  const tokens = (str) => String(str).toLowerCase().match(/[a-z0-9()_-]+/g) || [];
+  const stop = new Set(['what','is','the','for','a','an','of','to','in','on','and','or','url','link','endpoint','ip','host','address']);
+  
+  // Stable deduplication key function
+  const docKey = (d) => {
+    const doc = d?.document || {};
+    return doc.id || `${doc.filename || 'unknown'}|${String(doc.content || '').slice(0,100)}`;
+  };
+  
+  // Generic deduplication helper
+  const unique = (arr) => {
+    const seen = new Set();
+    return arr.filter(d => (seen.has(docKey(d)) ? false : (seen.add(docKey(d)), true)));
+  };
+
+  // Pre-process documents once to compute all properties
+  const urlIntent = /\b(url|link|endpoint|ip|host|address)\b/i.test(userQuestion);
+  const isUrlQuery = /\b(url|link|endpoint|ip|host|address|platform)\b/i.test(userQuestion);
+  const qTokens = tokens(userQuestion).filter(w => !stop.has(w));
+  
+  // Helper functions for document analysis
+  const getContentQualityScore = (content) => {
+    const wordCount = content.split(/\s+/).length;
+    const linkCount = (content.match(/https?:\/\//g) || []).length;
+    const downloadCount = (content.match(/download|attachment|browse/g) || []).length;
+    const hasPolicyContent = /^\d+\.\s|entitled to \d+|must be requested|effective date|last updated/i.test(content);
+    
+    // Higher score for more content, lower score for more references
+    const contentRatio = wordCount / Math.max(1, linkCount + downloadCount);
+    const policyBoost = hasPolicyContent ? 2.0 : 1.0;
+    
+    return contentRatio * policyBoost;
+  };
+  
+  const getFileTypePriority = (filename) => {
+    if (filename.includes('.pdf')) return 2.0;
+    if (filename.includes('.docx') || filename.includes('.doc')) return 1.8;
+    if (filename.includes('confluence')) return 0.7;  // Lower priority for Confluence
+    return 1.0;  // Default
+  };
+  
+  const determineIfJira = (filename, content) => {
+    // Strict Jira-only detector (not broad paragontesting detection)
+    const jiraDomainRx = /https?:\/\/[^\/]*atlassian\.net\//i;           // only Jira host
+    const jiraBrowseRx = /(?:^|\/)browse\/[A-Z][A-Z0-9]+-\d+\b/i;        // .../browse/TEC-123
+    const jiraKeyRx    = /\b[A-Z][A-Z0-9]+-\d+\b/;                       // TEC-123 style keys
+
+    const inJira = (s) => jiraDomainRx.test(s) || jiraBrowseRx.test(s) || /\bjira\b/i.test(s);
+
+    return inJira(filename) || inJira(content) ||
+           (jiraKeyRx.test(content) && jiraDomainRx.test(content)); // key + Jira host
+  };
+  
+  // Single pass through documents to compute all properties
+  const processedDocs = relevantDocs.map(d => {
+    const content = d.document.content || '';
+    const filename = d.document.filename || '';
+    
+    // Perform all regex tests once
+    const hasUrl = urlRx.test(content);
+    const hasIp = ipRx.test(content);
+    const isJiraFile = determineIfJira(filename, content);
+    
+    // Check for exact matches (must keep)
+    const text = content.toLowerCase();
+    const file = filename.toLowerCase();
+    const hasExactMatch = qTokens.some(w => text.includes(w) || file.includes(w)) ||
+                         text.includes('nor (platform)') || text.includes('nor celpip') ||
+                         text.includes('cael-registration.cael.ca');
+    
+    // Check for card chunks (short lines with URLs/IPs)
+    const lines = content.split('\n').map(s => s.trim()).filter(Boolean);
+    const isCardChunk = isUrlQuery && lines.length <= 8 && (hasUrl || hasIp);
+    
+    // Calculate adjusted score
+    let adjustedScore = d.score || 0;
+    if (isJiraFile) {
+      adjustedScore *= CONFIG.JIRA_SCORE_PENALTY; // 5% of original score
+    } else {
+      adjustedScore *= CONFIG.NON_JIRA_SCORE_BOOST; // 500% of original score
+    }
+    
+    // Apply content quality and file type adjustments
+    const contentQuality = getContentQualityScore(content);
+    const fileTypePriority = getFileTypePriority(filename);
+    adjustedScore *= contentQuality * fileTypePriority;
+
+    return {
+      ...d, // original document and score
+      hasUrl,
+      hasIp,
+      isJiraFile,
+      hasExactMatch,
+      isCardChunk,
+      adjustedScore
+    };
+  });
+
+  // Now sort once by the new score
+  processedDocs.sort((a, b) => b.adjustedScore - a.adjustedScore);
+  
+  // Extract must-keep documents
+  const mustKeepUrlDocs = urlIntent 
+    ? processedDocs.filter(d => d.hasUrl || d.hasIp)
+    : [];
+  const mustKeep = processedDocs.filter(d => d.hasExactMatch);
+  const cardDocs = processedDocs.filter(d => d.isCardChunk);
+  
+  // Add card docs to mustKeep if not already there
+  for (const cardDoc of cardDocs) {
+    const exists = mustKeep.some(d => docKey(d) === docKey(cardDoc));
+    if (!exists) {
+      mustKeep.push(cardDoc);
+    }
+  }
+  
+  if (urlIntent) {
+    context.log(`URL intent detected, prioritized ${mustKeepUrlDocs.length} URL/IP documents`);
+  }
+  context.log(`Found ${mustKeep.length} exact matches that must be kept`);
+  context.log(`Found ${cardDocs.length} card chunks for URL/IP query`);
+  context.log(`Applied priority adjustments: TEC content (paragontesting URLs) deprioritized, non-TEC content boosted`);
+
+  // Streamlined Funnel: Score & Rank → Preserve → Filter/Select
+  
+  // Step 1: Score & Rank (already done - processedDocs is sorted by adjustedScore)
+  context.log(`Documents ranked by adjusted scores, top score: ${processedDocs[0]?.adjustedScore || 0}`);
+  
+  // Step 2: Preserve - Identify must-keep documents from the top of ranked list
+  const topRankedDocs = processedDocs.slice(0, Math.min(CONFIG.TOP_RANKED_LIMIT, processedDocs.length));
+  const preservedMustKeep = mustKeep.filter(doc => 
+    topRankedDocs.some(topDoc => docKey(doc) === docKey(topDoc))
+  );
+  const preservedMustKeepUrlDocs = mustKeepUrlDocs.filter(doc => 
+    topRankedDocs.some(topDoc => docKey(doc) === docKey(topDoc))
+  );
+  
+  context.log(`Preserved ${preservedMustKeep.length} must-keep docs and ${preservedMustKeepUrlDocs.length} URL docs from top-ranked results`);
+  
+  // Step 3: Filter/Select - Take top N results (simplified approach)
+  const finalDocs = processedDocs.slice(0, Math.min(CONFIG.FINAL_SELECTION_LIMIT, processedDocs.length));
+  
+  // Step 4: Final selection - Combine preserved docs with filtered results
+  const finalSelection = unique([...preservedMustKeepUrlDocs, ...preservedMustKeep, ...finalDocs]);
+  
+  context.log(`Final selection: ${finalSelection.length} documents`);
+  
+  return finalSelection;
+}
+
 app.http('generateResponse', {
   methods: ['GET', 'POST', 'OPTIONS'],
   authLevel: 'anonymous',
   handler: async (request, context) => {
     try {
-      // Handle CORS preflight requests
-      if (request.method === 'OPTIONS') {
-        return {
-          status: 200,
-          headers: {
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-            'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With',
-            'Access-Control-Max-Age': '86400'
-          },
-          body: ''
-        };
-      }
-
       context.log('Starting to process question');
       
-      // Debug: Check if OpenAI is configured
-      context.log('Environment check:', {
-        hasOpenAIKey: !!process.env.OPENAI_API_KEY,
-        keyLength: process.env.OPENAI_API_KEY?.length || 0
-      });
-
-      let userQuestion, maxResults = 5;
-
-      if (request.method === 'GET') {
-        // Get question from URL params
-        userQuestion = request.query.get('question');
-        const numResults = request.query.get('top');
-        if (numResults) {
-          maxResults = parseInt(numResults);
-        }
-      } else {
-        // Get question from request body
-        const requestBody = await request.json();
-        userQuestion = requestBody.question;
-        maxResults = requestBody.top || 5;
+      // Step 1: Parse and validate request
+      const parseResult = await parseRequest(request);
+      if (parseResult.isCors) {
+        return parseResult.response;
       }
-
-      if (!userQuestion) {
-        return {
-          status: 400,
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            success: false,
-            error: 'Question parameter is required'
-          })
-        };
+      if (parseResult.error) {
+        return parseResult.error;
       }
-
+      
+      const { userQuestion, maxResults, sessionId } = parseResult;
       context.log(`Looking for info about: "${userQuestion}"`);
 
-      // Find documents that might have the answer using hybrid search
-      let relevantDocs;
-      try {
-        // Try hybrid search first (text + vector)
-        const queryEmbedding = await createEmbeddings([userQuestion]);
-        relevantDocs = await hybridSearch(userQuestion, queryEmbedding[0], maxResults);
-      } catch (error) {
-        // Fallback to text search if vector search fails
-        relevantDocs = await searchDocuments(userQuestion, maxResults);
-      }
+      // Step 2: Fetch conversation state
+      const conversationHistory = getConversationHistory(sessionId);
+
+      // Step 3: Retrieve candidates
+      const relevantDocs = await fetchCandidates(userQuestion, context);
       
-      context.log(`Found ${relevantDocs.length} initial documents`);
+      // Basic sanity logs
+      const preview = relevantDocs.slice(0, 12).map(d => ({
+        file: d.document.filename,
+        hasNOR: /(^|\b)nor(\b|[^a-z])/i.test(d.document.content || ''),
+        hasURL: /https?:\/\//i.test(d.document.content || '')
+      }));
+      context.log('retrievalPreview', JSON.stringify(preview, null, 2));
       
-      // Use smart LLM filtering to keep only relevant documents
-      const filteredDocs = await filterDocumentsWithLLM(userQuestion, relevantDocs);
-      context.log(`After LLM filtering: ${filteredDocs.length} relevant documents`);
+      const stats = {
+        total: relevantDocs.length,
+        anyNOR: relevantDocs.some(d => /(^|\b)nor(\b|[^a-z])/i.test(d.document.content || '')),
+        anyURL: relevantDocs.some(d => /https?:\/\//i.test(d.document.content || ''))
+      };
+      context.log('retrievalStats', stats);
+
+      // Step 4: Rank and filter documents
+      const filteredDocs = rankAndFilterDocuments(relevantDocs, userQuestion, context);
       
       if (filteredDocs.length === 0) {
         return {
@@ -97,13 +544,22 @@ app.http('generateResponse', {
         };
       }
 
-      // Pull together content from the filtered relevant docs
-      const documentContent = filteredDocs
-        .map(doc => doc.document.content)
-        .join('\n\n');
+      // Step 5: Generate snippets
+      const urlIntent = /\b(url|link|endpoint|ip|host|address)\b/i.test(userQuestion);
+      const snippets = buildSnippets(filteredDocs, {
+        maxSnippets: Math.min(CONFIG.DEFAULT_MAX_SNIPPETS, maxResults),
+        perDocCap: CONFIG.DEFAULT_PER_DOC_CAP,
+        maxCharsPerSnippet: CONFIG.DEFAULT_MAX_CHARS_PER_SNIPPET,
+        minChars: CONFIG.DEFAULT_MIN_CHARS,
+        promoteDiversity: true,
+        urlIntent
+      });
 
-      // Ask OpenAI to answer based on what we found
-      const aiAnswer = await getAnswerFromOpenAI(userQuestion, documentContent, filteredDocs);
+      // Step 6: Generate final answer
+      const aiAnswer = await getAnswerFromOpenAI(userQuestion, snippets, conversationHistory);
+
+      // Step 7: Update state and respond
+      saveConversation(sessionId, userQuestion, aiAnswer);
 
       // Check if AI is asking for clarification or can't provide specific answer
       const isNonSpecificAnswer = aiAnswer.toLowerCase().includes('more specific') || 
@@ -125,9 +581,13 @@ app.http('generateResponse', {
           success: true,
           question: userQuestion,
           response: aiAnswer,
-          sources: isNonSpecificAnswer ? [] : [...new Set(filteredDocs.map(doc => doc.document.filename))].map(filename => ({
-            filename: filename,
-            count: filteredDocs.filter(doc => doc.document.filename === filename).length
+          sessionId: sessionId,
+          sources: isNonSpecificAnswer ? [] : snippets.map(s => ({
+            id: s.id,
+            filename: s.filename,
+            page: s.page,
+            section: s.section,
+            preview: s.text.slice(0, 200) + (s.text.length > 200 ? '...' : '')
           })),
           searchResults: isNonSpecificAnswer ? 0 : filteredDocs.length
         }
@@ -152,31 +612,40 @@ app.http('generateResponse', {
   }
 });
 
-/**
- * Extract URL mappings from context to improve AI accuracy
- */
-function extractUrlMappings(context) {
-  const lines = context.split('\n');
-  const urlMappings = [];
-  
-  for (let i = 0; i < lines.length - 1; i++) {
-    const currentLine = lines[i].trim();
-    const nextLine = lines[i + 1].trim();
-    
-    // If current line looks like a service name and next line is a URL
-    if (currentLine && nextLine.startsWith('https://')) {
-      urlMappings.push({
-        service: currentLine,
-        url: nextLine
-      });
+
+function extractLinksAndIps(text) {
+  if (!text) return { pairs: [], urls: [], ips: [] };
+
+  const lines = String(text).split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+
+  const urlRx = /\bhttps?:\/\/[^\s)]+/gi;
+  const ipRx  = /\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b/g;
+
+  const urls = [...new Set((text.match(urlRx) || []))];
+  const ips  = [...new Set((text.match(ipRx) || []))];
+
+  // Heuristic: a "service name" line is short and has letters (like "NOR (Platform)")
+  const nameRx = /^[A-Za-z][A-Za-z0-9() ._-]{2,60}$/;
+
+  // Pair names with the closest following URL/IP within 3 lines
+  const pairs = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (!nameRx.test(lines[i])) continue;
+    for (let j = 1; j <= 3 && i + j < lines.length; j++) {
+      const u = (lines[i + j].match(urlRx) || [])[0];
+      const ip = (lines[i + j].match(ipRx) || [])[0];
+      if (u || ip) {
+        pairs.push({ service: lines[i], url: u || null, ip: ip || null });
+        break;
+      }
     }
   }
-  
-  return urlMappings;
+
+  return { pairs, urls, ips };
 }
 
-// Get an answer from OpenAI based on our document content
-async function getAnswerFromOpenAI(question, documentText, relevantDocs = []) {
+// Get an answer from OpenAI based on structured snippets
+async function getAnswerFromOpenAI(question, snippets = [], conversationHistory = []) {
   const apiKey = process.env.OPENAI_API_KEY;
   
   if (!apiKey) {
@@ -184,59 +653,91 @@ async function getAnswerFromOpenAI(question, documentText, relevantDocs = []) {
   }
 
   try {
-    // See if we can find any URL mappings to help with URL questions
-    const urlMappings = extractUrlMappings(documentText);
-    const urlInfo = urlMappings.length > 0 && question.toLowerCase().includes('url')
-      ? `\n\nAvailable URLs:\n${urlMappings.map(m => `${m.service}: ${m.url}`).join('\n')}`
+    // Extract URLs and IPs from all snippets
+    const allText = snippets.map(s => s.text).join('\n');
+    const linkData = extractLinksAndIps(allText);
+    const urlsBlock = linkData.pairs.length > 0
+      ? `\n\nServices found in context:\n${linkData.pairs.map(p => `- ${p.service}: ${p.url || p.ip || 'N/A'}`).join('\n')}`
       : '';
 
-    const systemPrompt = `Based on the following context from company documents, please answer the question accurately and completely.
+    // Build conversation context
+    const historyBlock = conversationHistory.slice(-6).map(msg => {
+      const short = String(msg.content || '').slice(0, 600);
+      return `${msg.role.toUpperCase()}: ${short}`;
+    }).join('\n');
 
-Guidelines:
-1. Use only information provided in the context
-2. Be specific and cite relevant details from the documents
-3. If the context doesn't contain enough information, say so clearly
-4. For policy questions, provide the exact policy details as stated
-5. For URL requests, match service names precisely
-6. If there are multiple relevant sections, summarize all relevant information
-7. IMPORTANT: Only use information that is directly relevant to the question. Ignore irrelevant content even if it appears in the context
-8. For technical questions (URLs, systems, etc.), focus only on technical documents and ignore policy/dress code documents
-9. For policy questions (dress code, procedures, etc.), focus only on policy documents
+    const systemPrompt = `You are a corporate HR/RAG assistant.
 
-Formatting Requirements:
-- Use line breaks to separate different points or sections
-- For lists, use numbered or bulleted format
-- For URLs, put each on a separate line
-- Use proper paragraph breaks for readability
-- Structure your response with clear sections when appropriate
+RULES:
+- Answer ONLY using the Provided Snippets; if insufficient, say you don't have enough info.
+- Include citation tags like [#id] for every factual claim.
+- If multiple snippets from the SAME document support a point, include multiple tags, e.g., [#2][#5].
+- Prefer consistency when snippets disagree: explain differences and cite both.
+- Return URLs ONLY if present verbatim in snippets.
+- Be concise and structured.
+- Use conversation history to understand context and references (like "one", "that", "it").
 
-Context:
-${documentText}${urlInfo}
+If the answer is under-specified, start with: "I need more context to answer precisely."
+
+FORMATTING REQUIREMENTS (CRITICAL):
+- Use bullet points (•) for each main point
+- Start each bullet with a clear statement
+- Put citations at the end of each bullet point
+- Use line breaks between different topics
+- Keep paragraphs short and focused
+- Structure information logically
+
+EXAMPLE FORMAT:
+• Employees are entitled to 20 vacation days per fiscal year [#1]
+• Vacation requests require supervisor approval [#2]
+• Leave without pay may be available as an alternative [#2]
+
+DO NOT write in paragraph form. ALWAYS use bullet points.`;
+
+    const contextBlock = snippets.map(sn => {
+      const loc = [
+        sn.filename,
+        sn.page != null ? `p.${sn.page}` : null,
+        sn.section ? `§${sn.section}` : null
+      ].filter(Boolean).join(' ');
+      return `[#${sn.id}] (${loc})\n${sn.text}`;
+    }).join('\n\n');
+
+    const providedContext = `
+Provided Snippets:
+${contextBlock}
+${urlsBlock}
+
+Recent Conversation (may provide referents only):
+${historyBlock || '(none)'}
+`;
+
+    const userPrompt = `${providedContext}
 
 Question: ${question}
 
-Answer:`;
+Answer with citations.`;
 
     const response = await axios.post('https://api.openai.com/v1/chat/completions', {
       model: 'gpt-3.5-turbo',
       messages: [
         {
           role: 'system',
-          content: 'You are a helpful HR assistant that answers questions based on company documents and policies. Provide accurate, complete answers based on the provided context. When answering policy questions, be thorough and include all relevant details. When providing URLs or specific information, be precise and match the exact terms used in the documents.'
+          content: systemPrompt
         },
         {
           role: 'user',
-          content: systemPrompt
+          content: userPrompt
         }
       ],
-      max_tokens: 800,  // Give it room for detailed answers
-      temperature: 0.3  // Keep responses focused but not robotic
+      max_tokens: CONFIG.OPENAI_MAX_TOKENS,  // Reasonable limit for structured responses
+      temperature: CONFIG.OPENAI_TEMPERATURE  // More focused responses
     }, {
       headers: {
         'Authorization': `Bearer ${apiKey}`,
         'Content-Type': 'application/json'
       },
-      timeout: 30000 // 30 second timeout to prevent socket hang up
+      timeout: CONFIG.OPENAI_TIMEOUT // 30 second timeout to prevent socket hang up
     });
 
     return response.data.choices[0].message.content;

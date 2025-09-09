@@ -2,6 +2,12 @@ const { RecursiveCharacterTextSplitter } = require('langchain/text_splitter');
 
 // Split text into chunks using Langchain
 async function chunkText(text) {
+  const t = (text || '').trim();
+  if (!t) return [];
+  
+  // Tiny document passthrough - keep as single chunk
+  if (t.length <= 400) return [t];
+  
   const textSplitter = new RecursiveCharacterTextSplitter({
     chunkSize: 1000,
     chunkOverlap: 200,
