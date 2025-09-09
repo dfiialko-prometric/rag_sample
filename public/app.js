@@ -279,4 +279,11 @@ function formatFileSize(bytes) {
     const sizes = ['Bytes', 'KB', 'MB', 'GB'];
     const i = Math.floor(Math.log(bytes) / Math.log(k));
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-} 
+}
+
+function showTab(tab, element) {
+    document.getElementById('chatTab').style.display = tab === 'chat' ? 'block' : 'none';
+    document.getElementById('documentsTab').style.display = tab === 'documents' ? 'block' : 'none';
+    document.querySelectorAll('.nav-item').forEach(item => item.classList.remove('active'));
+    element.classList.add('active');
+}
